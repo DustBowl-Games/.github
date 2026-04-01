@@ -16,7 +16,7 @@ Our production cluster runs on [Harvester HCI](https://harvesterhci.io/) with
 | Layer | Technology |
 |-------|-----------|
 | Hypervisor | Harvester HCI |
-| Kubernetes | RKE2 v1.34+ |
+| Kubernetes | RKE2 |
 | Storage | Longhorn (distributed, 3-replica) |
 | Load Balancing | MetalLB (Layer 2) |
 | Ingress | Traefik |
@@ -36,8 +36,7 @@ Our production cluster runs on [Harvester HCI](https://harvesterhci.io/) with
 - Runbooks and architecture documentation
 - Build-in-public notes from the cluster
 
-Internal cluster documentation lives at [git.internal.dustbowl.games](https://git.internal.dustbowl.games)
-(Gitea, self-hosted).
+Internal cluster documentation lives in a self-hosted Gitea instance.
 
 ---
 
