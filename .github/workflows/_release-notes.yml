@@ -1,0 +1,28 @@
+name: Reusable Release Notes
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "Tag name to release (defaults to github.ref_name)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create Release with Generated Notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: gh release create "$TAG" --generate-notes --verify-tag

@@ -1,0 +1,81 @@
+name: Reusable Self-Hosted Security Gate
+
+on:
+  workflow_call:
+    inputs:
+      fail_on_severity:
+        description: "Trivy severity levels that fail the build"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      image_ref:
+        description: "Optional OCI image reference to scan with Trivy"
+        required: false
+        type: string
+        default: ""
+      run_semgrep:
+        description: "Run Semgrep SAST scan"
+        required: false
+        type: boolean
+        default: true
+      semgrep_blocking:
+        description: "Fail the job if Semgrep finds issues"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  security-gate:
+    name: Self-Hosted Security Gate
+    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy Filesystem & IaC Scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "vuln,misconfig"
+          severity: ${{ inputs.fail_on_severity }}
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Run Trivy Container Image Scan
+        if: inputs.image_ref != ''
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ inputs.image_ref }}
+          severity: ${{ inputs.fail_on_severity }}
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Run Semgrep SAST
+        if: inputs.run_semgrep
+        run: |
+          set -euo pipefail
+          if ! command -v semgrep >/dev/null 2>&1; then
+            python3 -m pip install --quiet --break-system-packages semgrep || true
+          fi
+          if command -v semgrep >/dev/null 2>&1; then
+            if [ "${{ inputs.semgrep_blocking }}" = "true" ]; then
+              semgrep scan --config auto --error --quiet
+            else
+              semgrep scan --config auto --quiet || echo "::warning::Semgrep reported advisory findings"
+            fi
+          else
+            echo "::warning::Semgrep unavailable on runner; skipped"
+          fi

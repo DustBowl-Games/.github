@@ -1,0 +1,155 @@
+name: Reusable .NET Service CI
+
+on:
+  workflow_call:
+    inputs:
+      project_path:
+        description: "Path to .csproj or .sln"
+        required: true
+        type: string
+      dotnet_version:
+        description: ".NET SDK version"
+        required: false
+        type: string
+        default: "10.0.x"
+      sdk_image:
+        description: "Container SDK image"
+        required: false
+        type: string
+        default: "mcr.microsoft.com/dotnet/sdk:10.0"
+      helm_chart_path:
+        description: "Optional Helm chart directory to lint"
+        required: false
+        type: string
+        default: ""
+      image_name:
+        description: "GHCR image name (e.g. ghcr.io/dustbowl-games/my-service)"
+        required: false
+        type: string
+        default: ""
+      publish_image:
+        description: "Push immutable + branch tags to GHCR"
+        required: false
+        type: boolean
+        default: false
+      run_tests:
+        description: "Run dotnet test"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    container:
+      image: ${{ inputs.sdk_image }}
+      options: --security-opt=no-new-privileges
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare isolated .NET state
+        run: |
+          job_temp="$RUNNER_TEMP/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "$job_temp"
+          echo "DOTNET_JOB_TEMP=$job_temp" >> "$GITHUB_ENV"
+          echo "DOTNET_CLI_HOME=$job_temp/dotnet-cli-home" >> "$GITHUB_ENV"
+          echo "NUGET_PACKAGES=$job_temp/nuget-packages" >> "$GITHUB_ENV"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Restore & Build
+        run: |
+          dotnet restore "${{ inputs.project_path }}"
+          dotnet build "${{ inputs.project_path }}" -c Release --no-restore
+
+      - name: Check Vulnerable NuGet Packages
+        run: dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive
+
+      - name: Test
+        if: inputs.run_tests
+        run: dotnet test "${{ inputs.project_path }}" -c Release --no-build
+
+      - name: Restore workspace ownership
+        if: always()
+        run: |
+          [ -n "${DOTNET_JOB_TEMP:-}" ] && rm -rf -- "$DOTNET_JOB_TEMP"
+          workspace_owner="$(stat -c '%u:%g' "$RUNNER_WORKSPACE")"
+          chown --recursive "$workspace_owner" "$GITHUB_WORKSPACE"
+
+  helm-lint:
+    name: Helm Lint
+    if: inputs.helm_chart_path != ''
+    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.15.0
+      - run: helm lint "${{ inputs.helm_chart_path }}"
+
+  package-and-sbom:
+    name: Container Build, Scan & Publish
+    needs: [build-and-test]
+    if: inputs.image_name != ''
+    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build Container Image
+        run: docker build -t "${{ inputs.image_name }}:pr-check" .
+
+      - name: Trivy Container Scan (CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ inputs.image_name }}:pr-check"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ inputs.image_name }}:pr-check"
+          format: "cyclonedx"
+          output: "sbom.cdx.json"
+
+      - name: Upload SBOM Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          retention-days: 7
+
+      - name: Log in & Push to GHCR
+        if: inputs.publish_image && github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REPO: ${{ inputs.image_name }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sha_tag="${GITHUB_REF_NAME}-${GITHUB_SHA}"
+          docker tag "${IMAGE_REPO}:pr-check" "${IMAGE_REPO}:${sha_tag}"
+          docker tag "${IMAGE_REPO}:pr-check" "${IMAGE_REPO}:${GITHUB_REF_NAME}"
+          docker push "${IMAGE_REPO}:${sha_tag}"
+          docker push "${IMAGE_REPO}:${GITHUB_REF_NAME}"
