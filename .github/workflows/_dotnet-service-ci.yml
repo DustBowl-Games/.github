@@ -94,9 +94,11 @@ jobs:
         run: |
           job_temp="$RUNNER_TEMP/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
           mkdir -p "$job_temp"
-          echo "DOTNET_JOB_TEMP=$job_temp" >> "$GITHUB_ENV"
-          echo "DOTNET_CLI_HOME=$job_temp/dotnet-cli-home" >> "$GITHUB_ENV"
-          echo "NUGET_PACKAGES=$job_temp/nuget-packages" >> "$GITHUB_ENV"
+          {
+            echo "DOTNET_JOB_TEMP=$job_temp"
+            echo "DOTNET_CLI_HOME=$job_temp/dotnet-cli-home"
+            echo "NUGET_PACKAGES=$job_temp/nuget-packages"
+          } >> "$GITHUB_ENV"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0

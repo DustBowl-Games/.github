@@ -290,6 +290,8 @@ def run_actionlint(wf_files: list[pathlib.Path], repo_root: pathlib.Path, action
                 "fingerprint": m.group(4)[:140],
                 "message": f"line {m.group(2)}:{m.group(3)}: {m.group(4)}",
             })
+        elif line == "|" or re.match(r"^(?:\d+\s*)?\|", line):
+            continue
         else:
             findings.append({
                 "file": ".github/workflows",

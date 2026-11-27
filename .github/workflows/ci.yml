@@ -58,8 +58,10 @@ jobs:
 
           python3 -m venv "$RUNNER_TEMP/ci-venv"
           "$RUNNER_TEMP/ci-venv/bin/pip" install --quiet pyyaml semgrep
-          echo "CI_PYTHON=$RUNNER_TEMP/ci-venv/bin/python" >> "$GITHUB_ENV"
-          echo "CI_SEMGREP=$RUNNER_TEMP/ci-venv/bin/semgrep" >> "$GITHUB_ENV"
+          {
+            echo "CI_PYTHON=$RUNNER_TEMP/ci-venv/bin/python"
+            echo "CI_SEMGREP=$RUNNER_TEMP/ci-venv/bin/semgrep"
+          } >> "$GITHUB_ENV"
 
       - name: Run Python unit tests
         run: |

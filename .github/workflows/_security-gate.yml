@@ -105,7 +105,7 @@ jobs:
           FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
         run: |
           mkdir -p "$RUNNER_TEMP/docker-anon"
-          trivy_args=(fs --scanners vuln,misconfig --severity "$FAIL_ON_SEVERITY" --ignore-unfixed --exit-code 1)
+          trivy_args=(fs --scanners "vuln,misconfig" --severity "$FAIL_ON_SEVERITY" --ignore-unfixed --exit-code 1)
           if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
             trivy_args+=(--ignorefile /repo/.trivyignore)
           fi
