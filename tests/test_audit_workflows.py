@@ -296,6 +296,20 @@ class AuditWorkflowsTests(unittest.TestCase):
                 },
             ),
             (
+                "negated_full_name",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ !(github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
                 "reusable_missing_runner_labels",
                 {
                     True: {"pull_request": {}},
@@ -381,10 +395,25 @@ class AuditWorkflowsTests(unittest.TestCase):
         }
         self.assertEqual(audit_workflows.audit_workflow_doc(non_pr_reusable, ".github/workflows/rel.yml"), [])
 
+        safe_full_name_routing = {
+            True: {"pull_request": {}},
+            "permissions": {"contents": "read"},
+            "jobs": {
+                "j": {
+                    "runs-on": "${{ !(github.event.pull_request.draft) && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'self-hosted' }}",
+                    "timeout-minutes": 5,
+                    "steps": base_step,
+                }
+            },
+        }
+        self.assertEqual(audit_workflows.audit_workflow_doc(safe_full_name_routing, ".github/workflows/ok.yml"), [])
+
     def test_blocks_uppercase_format_and_bracket_script_injection(self):
         for expr in (
             "${{ GITHUB.EVENT.PULL_REQUEST.TITLE }}",
             "${{ format('{0}', github.event.pull_request.title) }}",
+            "${{ format('can''t {0}', github.event.pull_request.title) }}",
+            "${{ format('can''t } {0}', github.event.pull_request.title) }}",
             "${{ github['event']['pull_request']['title'] }}",
         ):
             with self.subTest(expr=expr):
@@ -402,18 +431,23 @@ class AuditWorkflowsTests(unittest.TestCase):
                 findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/inj.yml")
                 self.assertEqual([f["ruleId"] for f in findings], ["WF_NO_SCRIPT_INJECTION"])
 
-        safe_doc = {
-            True: {"pull_request": {}},
-            "permissions": {"contents": "read"},
-            "jobs": {
-                "j": {
-                    "runs-on": "ubuntu-latest",
-                    "timeout-minutes": 5,
-                    "steps": [{"run": "echo \"${{ format('{0}', github.repository) }}\""}],
+        for safe_expr in (
+            "${{ format('{0}', github.repository) }}",
+            "${{ format('can''t {0}', github.repository) }}",
+        ):
+            with self.subTest(safe_expr=safe_expr):
+                safe_doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "ubuntu-latest",
+                            "timeout-minutes": 5,
+                            "steps": [{"run": f'echo "{safe_expr}"'}],
+                        }
+                    },
                 }
-            },
-        }
-        self.assertEqual(audit_workflows.audit_workflow_doc(safe_doc, ".github/workflows/safe.yml"), [])
+                self.assertEqual(audit_workflows.audit_workflow_doc(safe_doc, ".github/workflows/safe.yml"), [])
 
 
 if __name__ == "__main__":

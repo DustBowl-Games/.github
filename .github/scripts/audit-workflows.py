@@ -50,7 +50,7 @@ PAID_ACTION_PREFIXES = (
     "semgrep/semgrep-action",
 )
 
-GHA_EXPR_RE = re.compile(r"\$\{\{((?:[^'}]|'[^']*')*)\}\}", re.DOTALL)
+GHA_EXPR_RE = re.compile(r"\$\{\{((?:[^'}]|'(?:[^']|'')*'|\}(?!\}))*)\}\}", re.DOTALL)
 UNTRUSTED_GHA_EXPR_RE = re.compile(
     r"(?:\bgithub\s*\.\s*(?:event\s*\.|head_ref\b)|github\s*\[\s*['\"]event['\"]\s*\])",
     re.IGNORECASE,
@@ -325,7 +325,7 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
             return False
         if "self-hosted" in before_or.lower():
             return False
-        if re.search(r"!(?!=)\s*\([^)]*head\.repo\.fork", before_or, re.IGNORECASE):
+        if re.search(r"!(?!=)\s*\([^)]*head\.repo\.(?:fork|full_name)", before_or, re.IGNORECASE):
             return False
         if re.search(r"!(?!=)\s*(?:github\.event\.pull_request\.)?head\.repo\.fork\b", before_or, re.IGNORECASE):
             return False
