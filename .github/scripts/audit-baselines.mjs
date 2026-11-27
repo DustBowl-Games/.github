@@ -8,6 +8,8 @@
  * - Line-based ignore files (.trivyignore, .gitleaksignore, .semgrepignore)
  * - Brand-new baseline/ignore files require Allow-Baseline-Init: #<issue> or URL
  *   in commit log or PR_BODY.
+ * - Deleting tracked baseline/ignore files requires Allow-Baseline-Removal: <reason>
+ *   in commit log or PR_BODY.
  */
 
 import fs from 'node:fs';
@@ -41,6 +43,7 @@ const BASELINE_JSON_KEYS = [
 ];
 
 const ALLOW_BASELINE_INIT_RE = /Allow-Baseline-Init:\s*(?:#\d+|https?:\/\/\S+)/i;
+const ALLOW_BASELINE_REMOVAL_RE = /Allow-Baseline-Removal:\s*\S+/i;
 
 export function normalizePath(p) {
   return p.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -76,6 +79,10 @@ export function hasBaselineInitApproval(commitText = '', prBody = process.env.PR
   return ALLOW_BASELINE_INIT_RE.test(`${commitText}\n${prBody}`);
 }
 
+export function hasBaselineRemovalApproval(commitText = '', prBody = process.env.PR_BODY || '') {
+  return ALLOW_BASELINE_REMOVAL_RE.test(`${commitText}\n${prBody}`);
+}
+
 function isBaselineCandidate(relPath) {
   const norm = normalizePath(relPath);
   const base = path.posix.basename(norm);
@@ -107,6 +114,29 @@ export function discoverBaselineFiles(repoRoot) {
     }
   }
   walk(repoRoot);
+  return out.sort();
+}
+
+export function discoverBaseBaselineFiles(repoRoot, baseRev) {
+  if (!baseRev || !String(baseRev).trim()) return [];
+  let raw = '';
+  try {
+    raw = execFileSync('git', ['ls-tree', '-r', '--name-only', '-z', String(baseRev).trim()], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const entry of raw.split('\0')) {
+    if (!entry) continue;
+    const norm = normalizePath(entry);
+    const parts = norm.split('/');
+    if (parts.slice(0, -1).some(part => IGNORED_DIRS.has(part))) continue;
+    if (isBaselineCandidate(norm)) out.push(norm);
+  }
   return out.sort();
 }
 
@@ -271,10 +301,11 @@ function main() {
   }
 
   const discovered = discoverBaselineFiles(repoRoot);
+  const baseDiscovered = discoverBaseBaselineFiles(repoRoot, revs.base);
   const explicit = pathsArg
     ? pathsArg.split(',').map(s => normalizePath(s.trim())).filter(Boolean)
     : [];
-  const targets = [...new Set([...discovered, ...explicit])].sort();
+  const targets = [...new Set([...discovered, ...baseDiscovered, ...explicit])].sort();
 
   if (targets.length === 0) {
     console.log('[PASS] No baseline or ignore files to ratchet.');
@@ -292,14 +323,22 @@ function main() {
   }
 
   const approvedInit = hasBaselineInitApproval(commitText);
+  const approvedRemoval = hasBaselineRemovalApproval(commitText);
   const violations = [];
 
   for (const rel of targets) {
     const absPath = path.join(repoRoot, rel);
-    if (!fs.existsSync(absPath)) continue;
+    const baseRaw = gitShowOrNull(repoRoot, revs.base, rel);
+    if (!fs.existsSync(absPath)) {
+      if (baseRaw !== null && !approvedRemoval) {
+        violations.push(
+          `${rel}: baseline/ignore file deleted without "Allow-Baseline-Removal: <reason>" in commit log or PR body.`
+        );
+      }
+      continue;
+    }
 
     const headRaw = fs.readFileSync(absPath, 'utf8');
-    const baseRaw = gitShowOrNull(repoRoot, revs.base, rel);
 
     if (baseRaw === null) {
       if (!approvedInit) {

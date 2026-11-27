@@ -8,7 +8,9 @@ import { fileURLToPath } from 'node:url';
 import {
   compareIgnoreFiles,
   compareJsonBaselines,
+  discoverBaseBaselineFiles,
   hasBaselineInitApproval,
+  hasBaselineRemovalApproval,
 } from '../.github/scripts/audit-baselines.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -74,6 +76,16 @@ test('hasBaselineInitApproval requires issue number or URL', () => {
   assert.equal(hasBaselineInitApproval('', 'Allow-Baseline-Init: https://github.com/org/repo/issues/12'), true);
   assert.equal(hasBaselineInitApproval('chore: init\n\nAllow-Baseline-Init: trust-me', ''), false);
   assert.equal(hasBaselineInitApproval('chore: init', ''), false);
+});
+
+test('hasBaselineRemovalApproval requires a non-empty reason', () => {
+  assert.equal(
+    hasBaselineRemovalApproval('chore: cleanup\n\nAllow-Baseline-Removal: all violations fixed (#123)', ''),
+    true
+  );
+  assert.equal(hasBaselineRemovalApproval('', 'Allow-Baseline-Removal: resolved'), true);
+  assert.equal(hasBaselineRemovalApproval('chore: cleanup\n\nAllow-Baseline-Removal:   ', ''), false);
+  assert.equal(hasBaselineRemovalApproval('chore: cleanup', ''), false);
 });
 
 test('CLI blocks unauthorized new .trivyignore in git repo and allows with Allow-Baseline-Init', () => {
@@ -152,5 +164,120 @@ test('CLI unions auto-discovered baseline/ignore files with --paths', () => {
     assert.match(failRes.stderr, /\.trivyignore/);
   } finally {
     fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test('CLI blocks silent deletion of tracked baseline files and allows approved or non-existent paths', () => {
+  // Case 1: Deleting one baseline while another remains
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-delete-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(tmpRepo, 'config'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'config', 'ai-smells-baseline.json'),
+      JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'EMPTY_CATCH', fingerprint: 'x', count: 1 }] })
+    );
+    fs.writeFileSync(path.join(tmpRepo, '.semgrepignore'), 'legacy/\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: initial baselines']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    assert.deepEqual(discoverBaseBaselineFiles(tmpRepo, baseSha), [
+      '.semgrepignore',
+      'config/ai-smells-baseline.json',
+    ]);
+
+    // Non-existent optional --paths file (neither in base nor head) succeeds cleanly
+    const passMissingOptionalRes = spawnSync(
+      process.execPath,
+      [
+        SCRIPT_PATH,
+        '--repo-root',
+        tmpRepo,
+        '--base',
+        baseSha,
+        '--head',
+        baseSha,
+        '--paths',
+        'config/optional-missing.json',
+      ],
+      { encoding: 'utf8' }
+    );
+    assert.equal(passMissingOptionalRes.status, 0, passMissingOptionalRes.stderr);
+    assert.doesNotMatch(passMissingOptionalRes.stderr, /ENOENT/);
+
+    // Delete tracked JSON baseline silently
+    git(['rm', 'config/ai-smells-baseline.json']);
+    git(['commit', '-m', 'chore: remove baseline silently']);
+    const headSha = git(['rev-parse', 'HEAD']).trim();
+
+    const failRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', headSha],
+      { encoding: 'utf8' }
+    );
+    assert.notEqual(failRes.status, 0);
+    assert.match(failRes.stderr, /BASELINE_RATCHET/);
+    assert.doesNotMatch(failRes.stderr, /ENOENT/);
+
+    // Approved via PR_BODY succeeds cleanly
+    const passPrRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', headSha],
+      { encoding: 'utf8', env: { ...process.env, PR_BODY: 'Allow-Baseline-Removal: all violations fixed (#123)' } }
+    );
+    assert.equal(passPrRes.status, 0, passPrRes.stderr);
+    assert.doesNotMatch(passPrRes.stderr, /ENOENT/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+
+  // Case 2: Deleting the sole tracked baseline file in the repository
+  const soleRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-delete-sole-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: soleRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(soleRepo, 'config'), { recursive: true });
+    fs.writeFileSync(
+      path.join(soleRepo, 'config', 'ai-smells-baseline.json'),
+      JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'EMPTY_CATCH', fingerprint: 'x', count: 1 }] })
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: initial sole baseline']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    git(['rm', 'config/ai-smells-baseline.json']);
+    git(['commit', '-m', 'chore: remove sole baseline silently']);
+    const silentHeadSha = git(['rev-parse', 'HEAD']).trim();
+
+    const failSoleRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', soleRepo, '--base', baseSha, '--head', silentHeadSha],
+      { encoding: 'utf8' }
+    );
+    assert.notEqual(failSoleRes.status, 0);
+    assert.match(failSoleRes.stderr, /BASELINE_RATCHET/);
+    assert.doesNotMatch(failSoleRes.stderr, /ENOENT/);
+
+    // Commit message approval also succeeds cleanly
+    git(['commit', '--amend', '-m', 'chore: remove sole baseline\n\nAllow-Baseline-Removal: all violations fixed (#123)']);
+    const approvedHeadSha = git(['rev-parse', 'HEAD']).trim();
+
+    const passCommitRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', soleRepo, '--base', baseSha, '--head', approvedHeadSha],
+      { encoding: 'utf8' }
+    );
+    assert.equal(passCommitRes.status, 0, passCommitRes.stderr);
+    assert.doesNotMatch(passCommitRes.stderr, /ENOENT/);
+  } finally {
+    fs.rmSync(soleRepo, { recursive: true, force: true });
   }
 });

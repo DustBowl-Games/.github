@@ -140,9 +140,9 @@ jobs:
       - name: Run Semgrep OSS SAST
         if: inputs.run_semgrep
         env:
-          SEMGREP_CONFIG: ${{ inputs.semgrep_config }}
-          SEMGREP_BLOCKING: ${{ inputs.semgrep_blocking }}
-          SEMGREP_BASELINE_COMMIT: ${{ inputs.semgrep_baseline_commit }}
+          GATE_SEMGREP_CONFIG: ${{ inputs.semgrep_config }}
+          GATE_SEMGREP_BLOCKING: ${{ inputs.semgrep_blocking }}
+          GATE_SEMGREP_BASELINE_COMMIT: ${{ inputs.semgrep_baseline_commit }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -151,7 +151,7 @@ jobs:
           "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep pyyaml
 
           cfg_args=()
-          for token in ${SEMGREP_CONFIG//,/ }; do
+          for token in ${GATE_SEMGREP_CONFIG//,/ }; do
             if [ -n "$token" ]; then
               cfg_args+=(--config "$token")
             fi
@@ -185,9 +185,9 @@ jobs:
             exit 1
           fi
 
-          scan_args=(scan --metrics=off "${cfg_args[@]}" --exclude ".org-ci" --quiet)
+          scan_args=(scan --metrics=off "${cfg_args[@]}" --exclude ".org-ci")
 
-          base_sha="$SEMGREP_BASELINE_COMMIT"
+          base_sha="$GATE_SEMGREP_BASELINE_COMMIT"
           if [ "$base_sha" = "auto" ]; then
             if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
               base_sha="$PR_BASE_SHA"
@@ -207,10 +207,11 @@ jobs:
             fi
           fi
 
-          if [ "$SEMGREP_BLOCKING" = "true" ]; then
+          if [ "$GATE_SEMGREP_BLOCKING" = "true" ]; then
             scan_args+=(--error --severity ERROR)
           fi
 
+          unset SEMGREP_BASELINE_COMMIT SEMGREP_BASELINE_REF
           "$RUNNER_TEMP/semgrep-venv/bin/semgrep" "${scan_args[@]}" .
 
       - name: Check Dockerfile & K8s/Helm Safety
