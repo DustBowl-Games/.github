@@ -1,0 +1,64 @@
+name: Reusable Factual Claims & No-Fake-Promises Gate
+
+on:
+  workflow_call:
+    inputs:
+      runner_labels:
+        description: "JSON array of runner labels (route fork PRs to ubuntu-latest)"
+        required: false
+        type: string
+        default: '["self-hosted","Linux","X64","dustbowl-linux"]'
+      allowlist_path:
+        description: "Path to verified-claims-allowlist.json in the caller repository"
+        required: false
+        type: string
+        default: "config/verified-claims-allowlist.json"
+      strict:
+        description: "Fail even on legacyAuditBaseline entries"
+        required: false
+        type: boolean
+        default: false
+      scan_all:
+        description: "Scan all public-facing files instead of diff-only"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  factual-claims:
+    name: "Audit: Factual Claims & No-Fake-Promises"
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout org factual-claims gate script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: DustBowl-Games/.github
+          path: .org-ci
+          sparse-checkout: .github/scripts/audit-factual-claims.mjs
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Run Factual Claims Gate
+        env:
+          ALLOWLIST_PATH: ${{ inputs.allowlist_path }}
+          STRICT_MODE: ${{ inputs.strict }}
+          SCAN_ALL: ${{ inputs.scan_all }}
+        run: |
+          args=(--allowlist "$GITHUB_WORKSPACE/$ALLOWLIST_PATH")
+          if [ "$SCAN_ALL" = "true" ]; then args+=(--all); fi
+          if [ "$STRICT_MODE" = "true" ]; then args+=(--strict); fi
+          node .org-ci/.github/scripts/audit-factual-claims.mjs "${args[@]}"

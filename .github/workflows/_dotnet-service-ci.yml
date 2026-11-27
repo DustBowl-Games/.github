@@ -3,6 +3,11 @@ name: Reusable .NET Service CI
 on:
   workflow_call:
     inputs:
+      runner_labels:
+        description: "JSON array of runner labels (route fork PRs to ubuntu-latest)"
+        required: false
+        type: string
+        default: '["self-hosted","Linux","X64","dustbowl-linux"]'
       project_path:
         description: "Path to .csproj or .sln"
         required: true
@@ -37,6 +42,11 @@ on:
         required: false
         type: boolean
         default: true
+      fail_on_vulnerable_nuget:
+        description: "Fail build if High or Critical NuGet vulnerabilities are detected"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -44,7 +54,7 @@ permissions:
 jobs:
   build-and-test:
     name: Build & Test
-    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     container:
       image: ${{ inputs.sdk_image }}
       options: --security-opt=no-new-privileges
@@ -74,7 +84,17 @@ jobs:
           dotnet build "${{ inputs.project_path }}" -c Release --no-restore
 
       - name: Check Vulnerable NuGet Packages
-        run: dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive
+        run: |
+          if [ "${{ inputs.fail_on_vulnerable_nuget }}" = "true" ]; then
+            out=$(dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive)
+            echo "$out"
+            if echo "$out" | grep -qiE '\b(High|Critical)\b'; then
+              echo "::error::High or Critical NuGet vulnerabilities detected."
+              exit 1
+            fi
+          else
+            dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive || true
+          fi
 
       - name: Test
         if: inputs.run_tests
@@ -90,7 +110,7 @@ jobs:
   helm-lint:
     name: Helm Lint
     if: inputs.helm_chart_path != ''
-    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -105,7 +125,7 @@ jobs:
     name: Container Build, Scan & Publish
     needs: [build-and-test]
     if: inputs.image_name != ''
-    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     timeout-minutes: 25
     permissions:
       contents: read
@@ -118,23 +138,42 @@ jobs:
       - name: Build Container Image
         run: docker build -t "${{ inputs.image_name }}:pr-check" .
 
-      - name: Trivy Container Scan (CRITICAL/HIGH)
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          image-ref: "${{ inputs.image_name }}:pr-check"
-          severity: "CRITICAL,HIGH"
-          exit-code: "1"
-          ignore-unfixed: true
+      - name: Trivy Container Scan (CRITICAL/HIGH, OSS)
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-anon"
+          ignore_mount=""
+          ignore_arg=""
+          if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+            ignore_mount="--volume $GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro"
+            ignore_arg="--ignorefile /.trivyignore"
+          fi
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            $ignore_mount \
+            "$TRIVY_IMAGE" image \
+            --severity "CRITICAL,HIGH" \
+            --ignore-unfixed \
+            $ignore_arg \
+            --exit-code 1 \
+            "${{ inputs.image_name }}:pr-check"
 
-      - name: Generate CycloneDX SBOM
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          image-ref: "${{ inputs.image_name }}:pr-check"
-          format: "cyclonedx"
-          output: "sbom.cdx.json"
+      - name: Generate CycloneDX SBOM (OSS)
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-anon"
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            --volume "$GITHUB_WORKSPACE:/out" \
+            "$TRIVY_IMAGE" image \
+            --format cyclonedx \
+            --output /out/sbom.cdx.json \
+            "${{ inputs.image_name }}:pr-check"
 
       - name: Upload SBOM Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json

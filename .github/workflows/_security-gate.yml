@@ -3,26 +3,41 @@ name: Reusable Self-Hosted Security Gate
 on:
   workflow_call:
     inputs:
+      runner_labels:
+        description: "JSON array of runner labels (route fork PRs to ubuntu-latest)"
+        required: false
+        type: string
+        default: '["self-hosted","Linux","X64","dustbowl-linux"]'
       fail_on_severity:
         description: "Trivy severity levels that fail the build"
         required: false
         type: string
         default: "CRITICAL,HIGH"
       image_ref:
-        description: "Optional OCI image reference to scan with Trivy"
+        description: "Optional OCI image reference to scan with Trivy OSS"
         required: false
         type: string
         default: ""
       run_semgrep:
-        description: "Run Semgrep SAST scan"
+        description: "Run Semgrep OSS SAST scan"
         required: false
         type: boolean
         default: true
+      semgrep_config:
+        description: "Semgrep OSS ruleset (local path or p/security-audit)"
+        required: false
+        type: string
+        default: "p/security-audit"
       semgrep_blocking:
         description: "Fail the job if Semgrep finds issues"
         required: false
         type: boolean
         default: false
+      check_dockerfile:
+        description: "Verify Dockerfile enforces non-root USER and bans :latest base tags"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -30,7 +45,7 @@ permissions:
 jobs:
   security-gate:
     name: Self-Hosted Security Gate
-    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -39,43 +54,92 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Run Gitleaks Secret Scan
-        uses: gitleaks/gitleaks-action@v2
+      - name: Run Gitleaks Secret Scan (OSS)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-anon"
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo" \
+            "$GITLEAKS_IMAGE" git /repo --redact=100 --gitleaks-ignore-path /repo
 
-      - name: Run Trivy Filesystem & IaC Scan
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          scan-type: "fs"
-          scan-ref: "."
-          scanners: "vuln,misconfig"
-          severity: ${{ inputs.fail_on_severity }}
-          exit-code: "1"
-          ignore-unfixed: true
+      - name: Run Trivy Filesystem & IaC Scan (OSS)
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-anon"
+          ignore_arg=""
+          if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+            ignore_arg="--ignorefile /repo/.trivyignore"
+          fi
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo" \
+            "$TRIVY_IMAGE" fs \
+            --scanners vuln,misconfig \
+            --severity "${{ inputs.fail_on_severity }}" \
+            --ignore-unfixed \
+            $ignore_arg \
+            --exit-code 1 \
+            /repo
 
-      - name: Run Trivy Container Image Scan
+      - name: Run Trivy Container Image Scan (OSS)
         if: inputs.image_ref != ''
-        uses: aquasecurity/trivy-action@0.30.0
-        with:
-          image-ref: ${{ inputs.image_ref }}
-          severity: ${{ inputs.fail_on_severity }}
-          exit-code: "1"
-          ignore-unfixed: true
+        env:
+          TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-anon"
+          ignore_mount=""
+          ignore_arg=""
+          if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+            ignore_mount="--volume $GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro"
+            ignore_arg="--ignorefile /.trivyignore"
+          fi
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            $ignore_mount \
+            "$TRIVY_IMAGE" image \
+            --severity "${{ inputs.fail_on_severity }}" \
+            --ignore-unfixed \
+            $ignore_arg \
+            --exit-code 1 \
+            "${{ inputs.image_ref }}"
 
-      - name: Run Semgrep SAST
+      - name: Set up Python for Semgrep OSS
+        if: inputs.run_semgrep
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Run Semgrep OSS SAST
         if: inputs.run_semgrep
         run: |
           set -euo pipefail
-          if ! command -v semgrep >/dev/null 2>&1; then
-            python3 -m pip install --quiet --break-system-packages semgrep || true
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep
+          cfg="${{ inputs.semgrep_config }}"
+          if [ -f ".semgrep/antislop-rules.yml" ]; then
+            cfg=".semgrep/antislop-rules.yml"
           fi
-          if command -v semgrep >/dev/null 2>&1; then
-            if [ "${{ inputs.semgrep_blocking }}" = "true" ]; then
-              semgrep scan --config auto --error --quiet
-            else
-              semgrep scan --config auto --quiet || echo "::warning::Semgrep reported advisory findings"
-            fi
+          if [ "${{ inputs.semgrep_blocking }}" = "true" ]; then
+            "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan --metrics=off --config "$cfg" --error --severity ERROR --quiet .
           else
-            echo "::warning::Semgrep unavailable on runner; skipped"
+            "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan --metrics=off --config "$cfg" --quiet . || echo "::warning::Semgrep reported advisory findings"
           fi
+
+      - name: Check Dockerfile Hardening
+        if: inputs.check_dockerfile
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "[INFO] No Dockerfile found; skipping."
+            exit 0
+          fi
+          if grep -iE '^FROM\s+.*:latest(\s|$)' Dockerfile; then
+            echo "::error::Dockerfile uses banned :latest base image tag."
+            exit 1
+          fi
+          last_user=$(grep -iE '^USER\s+' Dockerfile | tail -n 1 | awk '{print $2}' || true)
+          if [ -z "$last_user" ] || [ "$last_user" = "root" ] || [ "$last_user" = "0" ]; then
+            echo "::error::Dockerfile must end with a non-root USER instruction."
+            exit 1
+          fi
+          echo "[PASS] Dockerfile hardening check passed (USER $last_user)."

@@ -3,6 +3,11 @@ name: Reusable Release Notes
 on:
   workflow_call:
     inputs:
+      runner_labels:
+        description: "JSON array of runner labels"
+        required: false
+        type: string
+        default: '["self-hosted","Linux","X64","dustbowl-linux"]'
       tag_name:
         description: "Tag name to release (defaults to github.ref_name)"
         required: false
@@ -15,7 +20,7 @@ permissions:
 jobs:
   release:
     name: Create GitHub Release
-    runs-on: [self-hosted, Linux, X64, dustbowl-linux]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

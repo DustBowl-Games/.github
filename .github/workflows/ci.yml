@@ -1,0 +1,41 @@
+name: ".github Org CI"
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-workflows:
+    name: "Test: Reusable Workflow Contracts & Factual Claims"
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","dustbowl-linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Validate reusable workflow contracts
+        run: |
+          if ! python3 -c "import yaml" 2>/dev/null; then
+            python3 -m venv "$RUNNER_TEMP/yaml-venv"
+            "$RUNNER_TEMP/yaml-venv/bin/pip" install --quiet pyyaml
+            "$RUNNER_TEMP/yaml-venv/bin/python" -m unittest discover -s tests -p "test_*.py"
+          else
+            python3 -m unittest discover -s tests -p "test_*.py"
+          fi
+      - name: Run factual claims gate unit tests
+        run: node --test tests/audit-factual-claims.test.mjs

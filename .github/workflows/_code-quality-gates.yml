@@ -1,0 +1,203 @@
+name: Reusable Code Quality & Anti-Slop Gates
+
+on:
+  workflow_call:
+    inputs:
+      runner_labels:
+        description: "JSON array of runner labels (route fork PRs to ubuntu-latest)"
+        required: false
+        type: string
+        default: '["self-hosted","Linux","X64","dustbowl-linux"]'
+      run_commit_lint:
+        description: "Enforce Conventional Commits and ban AI buzzwords/watermarks"
+        required: false
+        type: boolean
+        default: true
+      run_complexity:
+        description: "Run Lizard cyclomatic complexity guard on changed files"
+        required: false
+        type: boolean
+        default: true
+      max_cyclomatic_complexity:
+        description: "Maximum permitted cyclomatic complexity"
+        required: false
+        type: number
+        default: 20
+      run_duplication:
+        description: "Run jscpd duplicate code scan"
+        required: false
+        type: boolean
+        default: false
+      duplication_threshold:
+        description: "Maximum permitted duplication percentage"
+        required: false
+        type: number
+        default: 10
+      duplication_paths:
+        description: "Space-separated directories to scan with jscpd"
+        required: false
+        type: string
+        default: "."
+      run_dead_code:
+        description: "Run Knip unused export/dependency audit"
+        required: false
+        type: boolean
+        default: false
+      run_dependency_drift:
+        description: "Verify NPM package-lock.json integrity"
+        required: false
+        type: boolean
+        default: true
+      run_postgres_migration_guard:
+        description: "Block non-concurrent CREATE INDEX in newly added Postgres migrations"
+        required: false
+        type: boolean
+        default: false
+      run_k8s_helm_lint:
+        description: "Run helm lint on helm_chart_dir"
+        required: false
+        type: boolean
+        default: false
+      helm_chart_dir:
+        description: "Helm chart directory to lint"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gates:
+    name: Code Quality & Anti-Slop Gates
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        if: inputs.run_duplication || inputs.run_dead_code || inputs.run_dependency_drift
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Conventional Commits & Anti-Slop Linter
+        if: inputs.run_commit_lint
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess, sys
+
+          CC_RE = re.compile(r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_\-\.\/]+\))?(!)?: (.+)$')
+          BUZZ_RE = re.compile(r'\b(?:delve|seamless(?:ly)?|tapestry|testament|robust(?:ly)?|leverage|cutting-edge|revolutionary|elevate|game-changer|plethora|multifaceted|holistic|synergy|paradigm|groundbreaking)\b', re.I)
+          WATERMARK_RE = re.compile(r'generated\s+by\s+(?:ai|claude|chatgpt|copilot|gemini|cursor)|co-authored-by:\s*(?:assistant|claude|chatgpt|copilot|gemini)|ai-generated|as\s+an\s+ai\b', re.I)
+
+          event = os.environ.get('GITHUB_EVENT_NAME', '')
+          if event == 'pull_request':
+              base = os.environ.get('BASE_SHA')
+              head = os.environ.get('HEAD_SHA')
+              raw = subprocess.check_output(['git', 'log', f'{base}..{head}', '--pretty=format:%H%x00%B%x00'], text=True)
+              chunks = raw.split('\x00')
+              msgs = [(chunks[i].strip(), chunks[i+1].strip()) for i in range(0, len(chunks)-1, 2) if chunks[i].strip()]
+          else:
+              sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              body = subprocess.check_output(['git', 'log', '-1', '--pretty=format:%B'], text=True).strip()
+              msgs = [(sha, body)]
+
+          errs = []
+          for sha, body in msgs:
+              lines = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith('#')]
+              if not lines:
+                  errs.append(f'{sha[:8]}: empty commit message')
+                  continue
+              subj = lines[0]
+              if subj.startswith(('Merge branch ', 'Merge remote-tracking branch ', 'Merge pull request #', 'Revert "')):
+                  continue
+              if not CC_RE.match(subj):
+                  errs.append(f'{sha[:8]}: invalid Conventional Commit subject: {subj}')
+              if len(subj) > 72:
+                  errs.append(f'{sha[:8]}: subject exceeds 72 chars ({len(subj)}): {subj}')
+              full = '\n'.join(lines)
+              m = BUZZ_RE.search(full)
+              if m:
+                  errs.append(f'{sha[:8]}: forbidden buzzword "{m.group(0)}"')
+              m = WATERMARK_RE.search(full)
+              if m:
+                  errs.append(f'{sha[:8]}: forbidden AI watermark "{m.group(0)}"')
+
+          if errs:
+              print('[FAIL] Commit lint violations:\n' + '\n'.join('  - ' + e for e in errs), file=sys.stderr)
+              sys.exit(1)
+          print(f'[PASS] {len(msgs)} commit(s) passed Conventional Commits & anti-slop check.')
+          PY
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      - name: Cyclomatic Complexity Guard (Lizard OSS)
+        if: inputs.run_complexity && github.event_name == 'pull_request'
+        run: |
+          changed=$(git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" -- '*.cs' '*.js' '*.mjs' '*.ts' '*.py' | grep -v '^Migrations/' || true)
+          if [ -z "$changed" ]; then
+            echo "[INFO] No code files changed; skipping complexity check."
+            exit 0
+          fi
+          python3 -m venv "$RUNNER_TEMP/lizard-venv"
+          "$RUNNER_TEMP/lizard-venv/bin/pip" install --quiet lizard
+          echo "$changed" | xargs "$RUNNER_TEMP/lizard-venv/bin/lizard" -C "${{ inputs.max_cyclomatic_complexity }}"
+
+      - name: Duplicate Code Scan (jscpd OSS)
+        if: inputs.run_duplication
+        run: |
+          npx --yes jscpd@4.0.5 --min-lines 15 --min-tokens 80 --threshold "${{ inputs.duplication_threshold }}" --reporters console \
+            --ignore "**/Migrations/**,**/wwwroot/css/**,**/tests/**,**/node_modules/**,**/bin/**,**/obj/**" \
+            ${{ inputs.duplication_paths }}
+
+      - name: NPM Lockfile Integrity & Dead Code Guard (Knip OSS)
+        if: inputs.run_dependency_drift || inputs.run_dead_code
+        run: |
+          if [ ! -f package.json ]; then
+            echo "[INFO] No package.json; skipping."
+            exit 0
+          fi
+          if [ "${{ inputs.run_dependency_drift }}" = "true" ]; then
+            npm ci --ignore-scripts
+          fi
+          if [ "${{ inputs.run_dead_code }}" = "true" ]; then
+            npx --yes knip
+          fi
+
+      - name: PostgreSQL Migration Safety Guard
+        if: inputs.run_postgres_migration_guard && github.event_name == 'pull_request'
+        run: |
+          added=$(git diff --name-only --diff-filter=A "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" -- 'Migrations/*.cs' | grep -v '\.Designer\.cs$' || true)
+          if [ -z "$added" ]; then
+            echo "[INFO] No new migrations added."
+            exit 0
+          fi
+          fail=0
+          for f in $added; do
+            if grep -iE 'CREATE\s+(UNIQUE\s+)?INDEX\b' "$f" | grep -qiEv '\bCONCURRENTLY\b'; then
+              echo "::error file=$f::Non-concurrent CREATE INDEX detected; use CONCURRENTLY."
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+      - name: Set up Helm
+        if: inputs.run_k8s_helm_lint && inputs.helm_chart_dir != ''
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.15.0
+
+      - name: Lint Helm Chart
+        if: inputs.run_k8s_helm_lint && inputs.helm_chart_dir != ''
+        run: helm lint "${{ inputs.helm_chart_dir }}"
