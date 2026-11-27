@@ -107,13 +107,17 @@ class AuditInfraSafetyTests(unittest.TestCase):
             "RUN curl -sSL https://example.com/a.sh | /bin/bash",
             "RUN wget -qO- https://example.com/a.sh | sudo sh",
             "RUN curl -sSL https://example.com/a.sh | sudo bash",
+            "RUN curl -sSL https://example.com/a.sh | sudo -E bash",
         ):
             with self.subTest(cmd=cmd):
                 df = f"FROM ubuntu:24.04\n{cmd}\nUSER 10001\n"
                 findings = audit_infra_safety.check_dockerfile_content(df, "Dockerfile")
                 self.assertEqual([f["ruleId"] for f in findings], ["DOCKERFILE_PIPE_TO_SHELL"])
 
-    def test_helm_values_flags_nested_image_latest_tag_without_false_positive(self):
+        clean_df = "FROM ubuntu:24.04\nRUN curl -sSL https://example.com/tool.tar.gz -o /tmp/tool.tar.gz\nUSER 10001\n"
+        self.assertEqual(audit_infra_safety.check_dockerfile_content(clean_df, "Dockerfile"), [])
+
+    def test_helm_values_flags_nested_image_latest_tag_and_yaml_anchor_without_false_positive(self):
         values = "\n".join([
             "image:",
             "  repository: ghcr.io/dustbowl-games/api",
@@ -126,6 +130,14 @@ class AuditInfraSafetyTests(unittest.TestCase):
             "  image:",
             "    repository: ghcr.io/dustbowl-games/sidecar",
             "    tag: 'latest'",
+            "anchored_bad:",
+            "  image: &img",
+            "    repository: ghcr.io/dustbowl-games/anchored",
+            "    tag: latest",
+            "anchored_clean:",
+            "  image: &img_clean",
+            "    repository: ghcr.io/dustbowl-games/anchored-clean",
+            '    tag: "1.4.2"',
             "release:",
             "  tag: latest",
             "clean:",
@@ -137,8 +149,8 @@ class AuditInfraSafetyTests(unittest.TestCase):
         ])
         findings = audit_infra_safety.check_k8s_helm_content(values, "helm/app/values.yaml")
         latest_findings = [f for f in findings if f["ruleId"] == "K8S_LATEST_IMAGE_TAG"]
-        self.assertEqual(len(latest_findings), 3)
-        self.assertEqual([f["line"] for f in latest_findings], [3, 7, 11])
+        self.assertEqual(len(latest_findings), 4)
+        self.assertEqual([f["line"] for f in latest_findings], [3, 7, 11, 15])
 
 
 if __name__ == "__main__":

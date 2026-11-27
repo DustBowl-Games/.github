@@ -163,11 +163,43 @@ function stripXmlCommentsInLine(text, state) {
   return out;
 }
 
+function stripXmlComments(xml) {
+  return String(xml || '').replace(/<!--[\s\S]*?(?:-->|$)/g, m => m.replace(/[^\n]/g, ' '));
+}
+
+function countRegexMatches(text, regex) {
+  const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
+  const matches = text.match(new RegExp(regex.source, flags));
+  return matches ? matches.length : 0;
+}
+
+function findFirstMatchLine(text, regex) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (regex.test(lines[i])) return i + 1;
+  }
+  return 1;
+}
+
+function gitShowOrNull(repoRoot, rev, relFile) {
+  if (!repoRoot || !rev || !relFile) return null;
+  try {
+    return execFileSync('git', ['show', `${rev}:${normalizePath(relFile)}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+}
+
 function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLines = null) {
   const trimmed = text.trim();
 
   if (CS_RE.test(relFile)) {
-    if (SINGLE_LINE_SKIP_RE.test(text)) {
+    const csCode = stripCsStrings(text);
+    if (SINGLE_LINE_SKIP_RE.test(csCode)) {
       findings.push({
         file: relFile,
         line: lineNum,
@@ -176,9 +208,9 @@ function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLin
         message: 'Skipped unit test attribute ([Fact(Skip=...)] / [Theory(Skip=...)]) is forbidden.',
       });
       state.inTestAttr = false;
-    } else if (MULTILINE_ATTR_START_RE.test(text) && !text.includes(')]')) {
+    } else if (MULTILINE_ATTR_START_RE.test(csCode) && !/\)\s*\]/.test(csCode)) {
       state.inTestAttr = true;
-      if (SKIP_ARG_RE.test(text)) {
+      if (SKIP_ARG_RE.test(csCode)) {
         findings.push({
           file: relFile,
           line: lineNum,
@@ -189,7 +221,7 @@ function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLin
         state.inTestAttr = false;
       }
     } else if (state.inTestAttr) {
-      if (SKIP_ARG_RE.test(text)) {
+      if (SKIP_ARG_RE.test(csCode)) {
         findings.push({
           file: relFile,
           line: lineNum,
@@ -198,10 +230,10 @@ function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLin
           message: 'Skipped unit test attribute (Skip=) is forbidden.',
         });
         state.inTestAttr = false;
-      } else if (text.includes(')') || text.includes(']')) {
+      } else if (csCode.includes(')') || csCode.includes(']')) {
         state.inTestAttr = false;
       }
-    } else if (SKIP_ARG_RE.test(text) && isInsideMultilineTestAttr(relFile, lineNum, getFileLines)) {
+    } else if (SKIP_ARG_RE.test(csCode) && isInsideMultilineTestAttr(relFile, lineNum, getFileLines)) {
       findings.push({
         file: relFile,
         line: lineNum,
@@ -310,18 +342,38 @@ export function applyBaseline(findings, baselineEntries = [], { strict = false }
 export function auditDiffLines(diffText, deletedFiles = [], commitText = '', options = {}) {
   const prBody = options.prBody ?? process.env.PR_BODY ?? '';
   const fileLinesCache = new Map();
-  const getFileLines = (options.readFileText || options.repoRoot)
+  const readHeadFileText = relFile => {
+    if (typeof options.readHeadFileText === 'function') {
+      return options.readHeadFileText(relFile);
+    }
+    if (typeof options.readFileText === 'function') {
+      return options.readFileText(relFile);
+    }
+    if (options.repoRoot && options.headRef) {
+      return gitShowOrNull(options.repoRoot, options.headRef, relFile);
+    }
+    if (options.repoRoot) {
+      const abs = path.join(options.repoRoot, relFile);
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+        return fs.readFileSync(abs, 'utf8');
+      }
+      return null;
+    }
+    return undefined;
+  };
+  const readBaseFileText = relFile => {
+    if (typeof options.readBaseFileText === 'function') {
+      return options.readBaseFileText(relFile);
+    }
+    if (options.repoRoot && options.baseRef) {
+      return gitShowOrNull(options.repoRoot, options.baseRef, relFile);
+    }
+    return undefined;
+  };
+  const getFileLines = (options.readHeadFileText || options.readFileText || options.repoRoot)
     ? relFile => {
         if (fileLinesCache.has(relFile)) return fileLinesCache.get(relFile);
-        let content = null;
-        if (typeof options.readFileText === 'function') {
-          content = options.readFileText(relFile);
-        } else if (options.repoRoot) {
-          const abs = path.join(options.repoRoot, relFile);
-          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-            content = fs.readFileSync(abs, 'utf8');
-          }
-        }
+        const content = readHeadFileText(relFile);
         const lines = typeof content === 'string' ? content.split(/\r?\n/) : null;
         fileLinesCache.set(relFile, lines);
         return lines;
@@ -330,22 +382,50 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
 
   const findings = [];
   const treatWarningsTracker = new Map();
+  const touchedBuildFiles = new Set();
+  const firstChangedLineByFile = new Map();
+  const basePathByFile = new Map();
   let currentFile = null;
+  let pendingMinusFile = null;
+  let isRename = false;
   let currentLine = 0;
   const lineState = { inTestAttr: false };
   const addXmlState = { inXmlComment: false };
   const remXmlState = { inXmlComment: false };
 
   for (const raw of diffText.split(/\r?\n/)) {
+    if (raw.startsWith('diff --git ')) {
+      currentFile = null;
+      pendingMinusFile = null;
+      isRename = false;
+      lineState.inTestAttr = false;
+      addXmlState.inXmlComment = false;
+      remXmlState.inXmlComment = false;
+      continue;
+    }
+    if (raw.startsWith('rename from ')) {
+      isRename = true;
+      continue;
+    }
     if (raw.startsWith('+++ ')) {
       const target = raw.slice(4).trim();
       currentFile = target === '/dev/null' ? null : normalizePath(target.replace(/^b\//, ''));
+      if (currentFile && CSPROJ_OR_BUILD_RE.test(currentFile) && !isIgnoredRel(currentFile)) {
+        touchedBuildFiles.add(currentFile);
+        if (isRename && pendingMinusFile && pendingMinusFile !== currentFile) {
+          basePathByFile.set(currentFile, pendingMinusFile);
+        }
+      } else if (!currentFile && pendingMinusFile && !isRename && CSPROJ_OR_BUILD_RE.test(pendingMinusFile) && !isIgnoredRel(pendingMinusFile)) {
+        touchedBuildFiles.add(pendingMinusFile);
+      }
       lineState.inTestAttr = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
       continue;
     }
     if (raw.startsWith('--- ')) {
+      const src = raw.slice(4).trim();
+      pendingMinusFile = src === '/dev/null' ? null : normalizePath(src.replace(/^a\//, ''));
       lineState.inTestAttr = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
@@ -354,6 +434,9 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
     if (raw.startsWith('@@ ')) {
       const m = raw.match(/\+(\d+)/);
       currentLine = m ? Number.parseInt(m[1], 10) : 1;
+      if (currentFile && !firstChangedLineByFile.has(currentFile)) {
+        firstChangedLineByFile.set(currentFile, currentLine || 1);
+      }
       lineState.inTestAttr = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
@@ -366,7 +449,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
       if (CSPROJ_OR_BUILD_RE.test(currentFile)) {
         const uncommented = stripXmlCommentsInLine(text, remXmlState);
         if (TREAT_WARN_TRUE_RE.test(uncommented)) {
-          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine || 1 };
+          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine || 1, falseFindings: [] };
           rec.removedTrue += 1;
           treatWarningsTracker.set(currentFile, rec);
         }
@@ -381,16 +464,18 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
       if (CSPROJ_OR_BUILD_RE.test(currentFile)) {
         const uncommented = stripXmlCommentsInLine(text, addXmlState);
         if (TREAT_WARN_FALSE_RE.test(uncommented)) {
-          findings.push({
+          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine, falseFindings: [] };
+          rec.falseFindings.push({
             file: currentFile,
             line: currentLine,
             ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
             fingerprint: normalizeFingerprint(text),
             message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
           });
+          treatWarningsTracker.set(currentFile, rec);
         }
         if (TREAT_WARN_TRUE_RE.test(uncommented)) {
-          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine };
+          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine, falseFindings: [] };
           rec.addedTrue += 1;
           treatWarningsTracker.set(currentFile, rec);
         }
@@ -405,7 +490,47 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
     }
   }
 
+  const fullFileCheckedBuildFiles = new Set();
+  for (const file of touchedBuildFiles) {
+    const baseFile = basePathByFile.get(file) || file;
+    const baseContent = readBaseFileText(baseFile);
+    const headContent = readHeadFileText(file);
+    if (baseContent === undefined || headContent === undefined) continue;
+
+    fullFileCheckedBuildFiles.add(file);
+    const baseActive = stripXmlComments(baseContent || '');
+    const headActive = stripXmlComments(headContent || '');
+    const baseTrue = countRegexMatches(baseActive, TREAT_WARN_TRUE_RE);
+    const headTrue = countRegexMatches(headActive, TREAT_WARN_TRUE_RE);
+    const baseFalse = countRegexMatches(baseActive, TREAT_WARN_FALSE_RE);
+    const headFalse = countRegexMatches(headActive, TREAT_WARN_FALSE_RE);
+    const reportedLine = firstChangedLineByFile.get(file) || 1;
+
+    if (headFalse > baseFalse) {
+      findings.push({
+        file,
+        line: findFirstMatchLine(headActive, TREAT_WARN_FALSE_RE) || reportedLine,
+        ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
+        fingerprint: '<TreatWarningsAsErrors>false</TreatWarningsAsErrors>',
+        message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
+      });
+    }
+    if (headTrue < baseTrue) {
+      findings.push({
+        file,
+        line: reportedLine,
+        ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
+        fingerprint: '<TreatWarningsAsErrors>true</TreatWarningsAsErrors> removed',
+        message: 'Removing or commenting out <TreatWarningsAsErrors>true</TreatWarningsAsErrors> is forbidden.',
+      });
+    }
+  }
+
   for (const [file, rec] of treatWarningsTracker.entries()) {
+    if (fullFileCheckedBuildFiles.has(file)) continue;
+    for (const ff of rec.falseFindings) {
+      findings.push(ff);
+    }
     if (rec.removedTrue > rec.addedTrue) {
       findings.push({
         file,
@@ -489,9 +614,22 @@ function resolveGitRange(repoRoot, baseArg, headArg) {
 function getGitDiffAndMeta(repoRoot, baseArg, headArg) {
   const range = resolveGitRange(repoRoot, baseArg, headArg);
   if (!range) {
-    return { diffText: '', deletedFiles: [], commitText: '' };
+    return { diffText: '', deletedFiles: [], commitText: '', baseRef: '', headRef: '' };
   }
-  const diffRange = range.includes('...') ? range : range.replace('..', '...');
+  const sep = range.includes('...') ? '...' : '..';
+  const [rawBase, rawHead] = range.split(sep);
+  const diffRange = `${rawBase}...${rawHead}`;
+  let baseRef = rawBase;
+  try {
+    const mergeBase = execFileSync('git', ['merge-base', rawBase, rawHead], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (mergeBase) baseRef = mergeBase;
+  } catch {
+    baseRef = rawBase;
+  }
   const diffText = execFileSync('git', ['diff', '-U0', diffRange], {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -515,6 +653,8 @@ function getGitDiffAndMeta(repoRoot, baseArg, headArg) {
     diffText,
     deletedFiles: delOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
     commitText,
+    baseRef,
+    headRef: rawHead,
   };
 }
 
@@ -560,8 +700,8 @@ function main() {
   if (scanAll) {
     findings = auditRepoFiles(repoRoot);
   } else {
-    const { diffText, deletedFiles, commitText } = getGitDiffAndMeta(repoRoot, baseArg, headArg);
-    findings = auditDiffLines(diffText, deletedFiles, commitText, { repoRoot });
+    const { diffText, deletedFiles, commitText, baseRef, headRef } = getGitDiffAndMeta(repoRoot, baseArg, headArg);
+    findings = auditDiffLines(diffText, deletedFiles, commitText, { repoRoot, baseRef, headRef });
   }
 
   const { baselined, unapproved } = applyBaseline(findings, baselineEntries, { strict });

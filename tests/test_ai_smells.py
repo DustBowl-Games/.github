@@ -209,6 +209,23 @@ class AuditAiSmellsTests(unittest.TestCase):
             ])
             self.assertEqual(rc_bad_diff, 1)
 
+    def test_nested_config_baseline_is_not_exempt_unless_passed_via_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp)
+            nested = repo / "src" / "config" / "fake-baseline.json"
+            nested.parent.mkdir(parents=True)
+            nested.write_text('{\n  "ai_smells_baseline": [],\n  "note": "// TODO: ungrounded"\n}\n', encoding="utf-8")
+
+            rc_fail = audit_ai_smells.main(["--repo-root", str(repo), "--all"])
+            self.assertEqual(rc_fail, 1)
+
+            rc_pass = audit_ai_smells.main([
+                "--repo-root", str(repo),
+                "--all",
+                "--baseline", "src/config/fake-baseline.json",
+            ])
+            self.assertEqual(rc_pass, 0)
+
     def test_self_scan_of_dotgithub_repo_passes_cleanly(self):
         rc = audit_ai_smells.main(["--repo-root", str(ROOT), "--all"])
         self.assertEqual(rc, 0)

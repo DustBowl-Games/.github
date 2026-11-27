@@ -65,7 +65,7 @@ TEST_OR_RULE_EXEMPT_RE = re.compile(
 )
 
 BASELINE_OR_ALLOWLIST_RE = re.compile(
-    r"(?:^|/)(?:config/.*(?:baseline|allowlist).*\.json|\.github/.*baseline.*\.json)$",
+    r"^(?:config/.*(?:baseline|allowlist).*\.json|\.github/.*baseline.*\.json)$",
     re.IGNORECASE,
 )
 

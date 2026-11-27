@@ -278,3 +278,92 @@ test('blocks TreatWarningsAsErrors weakened by commenting it out in XML', () => 
   const f2 = auditDiffLines(multiLineCommentDiff, [], '');
   assert.equal(f2.some(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED'), true);
 });
+
+test('CLI catches multiline XML-commented TreatWarningsAsErrors under real git diff -U0 when indentation is unchanged', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-integrity-xml-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    const propsFile = path.join(tmpRepo, 'Directory.Build.props');
+    fs.writeFileSync(
+      propsFile,
+      [
+        '<Project>',
+        '  <PropertyGroup>',
+        '    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+        '  </PropertyGroup>',
+        '</Project>',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: enable warnings as errors']);
+
+    // Benign edit keeping TreatWarningsAsErrors active must pass
+    fs.writeFileSync(
+      propsFile,
+      [
+        '<Project>',
+        '  <PropertyGroup>',
+        '    <Nullable>enable</Nullable>',
+        '    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+        '  </PropertyGroup>',
+        '</Project>',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: enable nullable']);
+
+    const passRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', 'HEAD~1', '--head', 'HEAD'],
+      { encoding: 'utf8' }
+    );
+    assert.equal(passRes.status, 0, passRes.stderr);
+
+    // Wrap line with <!-- above and --> below without changing indentation
+    fs.writeFileSync(
+      propsFile,
+      [
+        '<Project>',
+        '  <PropertyGroup>',
+        '    <Nullable>enable</Nullable>',
+        '    <!--',
+        '    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+        '    -->',
+        '  </PropertyGroup>',
+        '</Project>',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: comment out TreatWarningsAsErrors']);
+
+    const failRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', 'HEAD~1', '--head', 'HEAD'],
+      { encoding: 'utf8' }
+    );
+    assert.equal(failRes.status, 1);
+    assert.match(failRes.stderr, /TREAT_WARNINGS_AS_ERRORS_WEAKENED/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test('catches Skip = after string literal containing ) and ignores Skip = inside DisplayName string', () => {
+  const diff = [
+    '+++ b/tests/StringAttrTests.cs',
+    '@@ -1,0 +1,4 @@',
+    '+[Theory(DisplayName = "a)b", Skip = "later")]',
+    '+public void Skipped_With_Paren_In_String() {}',
+    '+[Theory(DisplayName = "Skip = x")]',
+    '+public void Valid_With_Skip_In_DisplayName() {}',
+  ].join('\n');
+
+  const findings = auditDiffLines(diff, [], '');
+  const skipFindings = findings.filter(f => f.ruleId === 'SKIPPED_TEST');
+  assert.equal(skipFindings.length, 1);
+  assert.equal(skipFindings[0].line, 1);
+});

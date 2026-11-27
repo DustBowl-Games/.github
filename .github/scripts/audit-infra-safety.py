@@ -55,7 +55,7 @@ ADD_RE = re.compile(r"^ADD\s+(?P<rest>.+)$", re.IGNORECASE)
 RUN_RE = re.compile(r"^RUN\s+(?P<rest>.+)$", re.IGNORECASE)
 CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-[A-Za-z]+\s+)*(?:0*777|a\+rwx)\b")
 PIPE_SHELL_RE = re.compile(
-    r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:(?:sudo|(?:/usr/bin/)?env)\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash)\b",
+    r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo(?:\s+-[A-Za-z0-9-]+)*\s+|(?:/usr/bin/)?env\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash)\b",
     re.IGNORECASE,
 )
 SHA256_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$", re.IGNORECASE)
@@ -317,7 +317,7 @@ def check_k8s_helm_content(content: str, rel_path: str) -> list[dict]:
                     "fingerprint": stripped[:140],
                     "message": "Pin container image tags to immutable versions or digests instead of :latest.",
                 })
-            if not val or val.startswith("#"):
+            if not val or val.startswith(("#", "&")):
                 key_stack.append((indent, key))
 
         if re.search(r"^\s*securityContext\s*:", content, re.MULTILINE) and not READONLY_ROOTFS_TRUE_RE.search(content):
