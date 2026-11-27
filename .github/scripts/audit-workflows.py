@@ -52,7 +52,7 @@ PAID_ACTION_PREFIXES = (
 SCRIPT_INJECTION_RE = re.compile(
     r"\$\{\{[^}]*\bgithub\.(?:event\.|head_ref\b)[^}]*\}\}"
 )
-PR_HEAD_REF_RE = re.compile(r"github\.(?:event\.pull_request\.head|head_ref)")
+PR_HEAD_REF_RE = re.compile(r"(?:github\.(?:event\.pull_request\.head|head_ref)|refs/pull/)", re.IGNORECASE)
 SAFE_IF_EXCLUSION_RE = re.compile(
     r"""github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]"""
     r"""|github\.event\.pull_request\.head\.repo\.full_name\s*==\s*github\.repository"""

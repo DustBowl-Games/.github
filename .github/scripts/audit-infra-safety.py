@@ -54,7 +54,10 @@ USER_RE = re.compile(r"^USER\s+(?P<user>\S+)", re.IGNORECASE)
 ADD_RE = re.compile(r"^ADD\s+(?P<rest>.+)$", re.IGNORECASE)
 RUN_RE = re.compile(r"^RUN\s+(?P<rest>.+)$", re.IGNORECASE)
 CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-[A-Za-z]+\s+)*(?:0*777|a\+rwx)\b")
-PIPE_SHELL_RE = re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:env\s+)?(?:sh|bash|zsh|ash|dash)\b", re.IGNORECASE)
+PIPE_SHELL_RE = re.compile(
+    r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:(?:sudo|(?:/usr/bin/)?env)\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash)\b",
+    re.IGNORECASE,
+)
 SHA256_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$", re.IGNORECASE)
 LATEST_TAG_RE = re.compile(r":latest(?:@sha256:[0-9a-f]{64})?$", re.IGNORECASE)
 
@@ -105,6 +108,8 @@ WORKLOAD_KIND_RE = re.compile(r"^\s*kind\s*:\s*(Deployment|StatefulSet|DaemonSet
 READONLY_ROOTFS_TRUE_RE = re.compile(r"^\s*(?:-\s*)?readOnlyRootFilesystem\s*:\s*true(?:\s|$|#)", re.MULTILINE)
 READONLY_ROOTFS_FALSE_RE = re.compile(r"^\s*(?:-\s*)?readOnlyRootFilesystem\s*:\s*false(?:\s|$|#)", re.MULTILINE)
 TOYAML_SEC_CTX_RE = re.compile(r"toYaml\s+[^\n]*[sS]ecurityContext")
+VALUES_KEY_RE = re.compile(r"^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+)\s*:\s*(.*)$")
+VALUES_LATEST_TAG_VAL_RE = re.compile(r"^['\"]?latest['\"]?(?:\s+#.*)?$", re.IGNORECASE)
 
 
 def normalize_path(rel_path: str) -> str:
@@ -277,8 +282,44 @@ def check_k8s_helm_content(content: str, rel_path: str) -> list[dict]:
             })
 
     # Check workload documents and values files for missing readOnlyRootFilesystem: true
+    # and nested image.tag: latest in Helm values*.yaml
     base_name = pathlib.PurePosixPath(norm_file).name.lower()
     if base_name.startswith("values") and base_name.endswith((".yml", ".yaml")):
+        key_stack: list[tuple[int, str]] = []
+        for line_no, raw in enumerate(lines, start=1):
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m_kv = VALUES_KEY_RE.match(raw)
+            if not m_kv:
+                continue
+            indent = len(m_kv.group(1))
+            if re.match(r"^\s*-\s+", raw):
+                indent += 2
+            key = m_kv.group(2)
+            val = m_kv.group(3).strip()
+            while key_stack and key_stack[-1][0] >= indent:
+                key_stack.pop()
+            if key.lower() == "tag" and any(k.lower() == "image" for _, k in key_stack):
+                if VALUES_LATEST_TAG_VAL_RE.match(val):
+                    findings.append({
+                        "file": norm_file,
+                        "line": line_no,
+                        "ruleId": "K8S_LATEST_IMAGE_TAG",
+                        "fingerprint": stripped[:140],
+                        "message": "Pin container image tags to immutable versions or digests instead of :latest.",
+                    })
+            elif key.lower() == "image" and re.search(r"\btag\s*:\s*['\"]?latest['\"]?(?:\b|$)", val, re.IGNORECASE):
+                findings.append({
+                    "file": norm_file,
+                    "line": line_no,
+                    "ruleId": "K8S_LATEST_IMAGE_TAG",
+                    "fingerprint": stripped[:140],
+                    "message": "Pin container image tags to immutable versions or digests instead of :latest.",
+                })
+            if not val or val.startswith("#"):
+                key_stack.append((indent, key))
+
         if re.search(r"^\s*securityContext\s*:", content, re.MULTILINE) and not READONLY_ROOTFS_TRUE_RE.search(content):
             if not READONLY_ROOTFS_FALSE_RE.search(content):
                 findings.append({

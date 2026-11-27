@@ -88,6 +88,7 @@ jobs:
           sparse-checkout: |
             .semgrep/antislop-rules.yml
             .github/scripts/audit-infra-safety.py
+            .github/scripts/merge-semgrep-rules.py
           persist-credentials: false
 
       - name: Run Gitleaks Secret Scan (OSS)
@@ -147,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/semgrep-venv"
-          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep pyyaml
 
           cfg_args=()
           for token in ${SEMGREP_CONFIG//,/ }; do
@@ -164,19 +165,10 @@ jobs:
             else
               merged_org="$RUNNER_TEMP/org-antislop-nonoverlapping.yml"
               rm -f "$merged_org"
-              "$RUNNER_TEMP/semgrep-venv/bin/python" -c '
-              import sys, yaml
-              org_path, caller_path, out_path = sys.argv[1:4]
-              with open(caller_path, encoding="utf-8") as f:
-                  caller_doc = yaml.safe_load(f) or {}
-              with open(org_path, encoding="utf-8") as f:
-                  org_doc = yaml.safe_load(f) or {}
-              caller_ids = {r.get("id") for r in caller_doc.get("rules", []) if isinstance(r, dict)}
-              extra = [r for r in org_doc.get("rules", []) if isinstance(r, dict) and r.get("id") not in caller_ids]
-              if extra:
-                  with open(out_path, "w", encoding="utf-8") as f:
-                      yaml.safe_dump({"rules": extra}, f, sort_keys=False)
-              ' "$org_rules" "$caller_rules" "$merged_org"
+              "$RUNNER_TEMP/semgrep-venv/bin/python" .org-ci/.github/scripts/merge-semgrep-rules.py \
+                --org "$org_rules" \
+                --caller "$caller_rules" \
+                --out "$merged_org"
               if [ -s "$merged_org" ]; then
                 cfg_args+=(--config "$merged_org")
               fi

@@ -173,6 +173,29 @@ class AuditWorkflowsTests(unittest.TestCase):
                 rc = audit_workflows.main(["--repo-root", str(root)])
             self.assertEqual(rc, 1)
 
+    def test_blocks_refs_pull_checkout_under_pull_request_target(self):
+        bad = {
+            True: {"pull_request_target": {}},
+            "permissions": {"contents": "read"},
+            "jobs": {
+                "unsafe": {
+                    "runs-on": "ubuntu-latest",
+                    "timeout-minutes": 10,
+                    "steps": [
+                        {
+                            "uses": PINNED_CHECKOUT,
+                            "with": {
+                                "persist-credentials": False,
+                                "ref": "refs/pull/${{ github.event.pull_request.number }}/merge",
+                            },
+                        },
+                    ],
+                }
+            },
+        }
+        findings = audit_workflows.audit_workflow_doc(bad, ".github/workflows/pr-target.yml")
+        self.assertEqual([f["ruleId"] for f in findings], ["WF_NO_PULL_REQUEST_TARGET_HEAD_CHECKOUT"])
+
 
 if __name__ == "__main__":
     unittest.main()

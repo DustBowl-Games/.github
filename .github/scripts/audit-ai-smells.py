@@ -64,6 +64,11 @@ TEST_OR_RULE_EXEMPT_RE = re.compile(
     re.IGNORECASE,
 )
 
+BASELINE_OR_ALLOWLIST_RE = re.compile(
+    r"(?:^|/)(?:config/.*(?:baseline|allowlist).*\.json|\.github/.*baseline.*\.json)$",
+    re.IGNORECASE,
+)
+
 AI_NARRATION_RE = re.compile(
     r"(?:here\s+is\s+the\s+updated|here's\s+the\s+updated|as\s+requested|"
     r"hope\s+this\s+helps|let\s+me\s+know\s+if\s+you|i\s+have\s+updated|"
@@ -119,6 +124,15 @@ def is_ignored_rel(rel_path: str) -> bool:
     return any(part in IGNORED_DIRS for part in parts[:-1])
 
 
+def is_exempt_baseline_path(rel_path: str, extra_exempt_rels: set[str] | None = None) -> bool:
+    norm = normalize_path(rel_path)
+    if BASELINE_OR_ALLOWLIST_RE.search(norm):
+        return True
+    if extra_exempt_rels and norm in extra_exempt_rels:
+        return True
+    return False
+
+
 def is_text_path(rel_path: str) -> bool:
     name = pathlib.PurePosixPath(normalize_path(rel_path)).name
     if name == "Dockerfile" or name.startswith("Dockerfile.") or name.endswith(".Dockerfile"):
@@ -158,9 +172,10 @@ def audit_lines_block(
     rel_path: str,
     *,
     allow_markdown_dashes: bool = False,
+    exempt_paths: set[str] | None = None,
 ) -> list[dict]:
     norm_file = normalize_path(rel_path)
-    if not is_text_path(norm_file):
+    if not is_text_path(norm_file) or is_exempt_baseline_path(norm_file, exempt_paths):
         return []
 
     findings: list[dict] = []
@@ -315,18 +330,25 @@ def audit_content(
     rel_path: str,
     *,
     allow_markdown_dashes: bool = False,
+    exempt_paths: set[str] | None = None,
 ) -> list[dict]:
     if "\x00" in content:
         return []
     raw_lines = content.splitlines()
     lines = [(idx + 1, raw) for idx, raw in enumerate(raw_lines)]
-    return audit_lines_block(lines, rel_path, allow_markdown_dashes=allow_markdown_dashes)
+    return audit_lines_block(
+        lines,
+        rel_path,
+        allow_markdown_dashes=allow_markdown_dashes,
+        exempt_paths=exempt_paths,
+    )
 
 
 def audit_diff_text(
     diff_text: str,
     *,
     allow_markdown_dashes: bool = False,
+    exempt_paths: set[str] | None = None,
 ) -> list[dict]:
     findings: list[dict] = []
     current_file: str | None = None
@@ -341,6 +363,7 @@ def audit_diff_text(
                     hunk_lines,
                     current_file,
                     allow_markdown_dashes=allow_markdown_dashes,
+                    exempt_paths=exempt_paths,
                 )
             )
         hunk_lines = []
@@ -521,11 +544,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] Repository root does not exist: {repo_root}", file=sys.stderr)
         return 1
 
+    extra_exempt_rels: set[str] = set()
     baseline_entries: list[dict] = []
     if args.baseline:
         bpath = pathlib.Path(args.baseline)
         if not bpath.is_absolute():
             bpath = (repo_root / bpath).resolve()
+        else:
+            bpath = bpath.resolve()
+        try:
+            extra_exempt_rels.add(normalize_path(str(bpath.relative_to(repo_root))))
+        except ValueError:
+            pass
         try:
             baseline_entries = load_baseline(bpath)
         except Exception as exc:
@@ -542,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                     content,
                     rel,
                     allow_markdown_dashes=args.allow_markdown_dashes,
+                    exempt_paths=extra_exempt_rels,
                 )
             )
     else:
@@ -553,10 +584,11 @@ def main(argv: list[str] | None = None) -> int:
         findings = audit_diff_text(
             diff_text,
             allow_markdown_dashes=args.allow_markdown_dashes,
+            exempt_paths=extra_exempt_rels,
         )
 
     if args.print_baseline:
-        print(json.dumps({"ai_smells_baseline": build_baseline_payload(findings)}, indent=2))
+        print(json.dumps({"ai_smells_baseline": build_baseline_payload(findings)}, indent=2, ensure_ascii=True))
         return 0
 
     baselined, unapproved = apply_baseline(findings, baseline_entries)

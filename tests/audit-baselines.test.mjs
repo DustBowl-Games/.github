@@ -118,3 +118,39 @@ test('CLI blocks unauthorized new .trivyignore in git repo and allows with Allow
     fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });
+
+test('CLI unions auto-discovered baseline/ignore files with --paths', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-union-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.writeFileSync(path.join(tmpRepo, '.trivyignore'), 'CVE-2024-0001\n');
+    fs.mkdirSync(path.join(tmpRepo, 'waivers'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'waivers', 'custom.json'),
+      JSON.stringify({ baseline: [{ file: 'a.cs', ruleId: 'R1', count: 1 }] })
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: initial baselines']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    // Grow .trivyignore while passing --paths waivers/custom.json (which is unchanged)
+    fs.writeFileSync(path.join(tmpRepo, '.trivyignore'), 'CVE-2024-0001\nCVE-2025-9999\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: sneak trivyignore entry']);
+    const headSha = git(['rev-parse', 'HEAD']).trim();
+
+    const failRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', headSha, '--paths', 'waivers/custom.json'],
+      { encoding: 'utf8' }
+    );
+    assert.notEqual(failRes.status, 0);
+    assert.match(failRes.stderr, /\.trivyignore/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});

@@ -1,5 +1,10 @@
+import contextlib
 import importlib.util
+import io
+import json
 import pathlib
+import subprocess
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -98,6 +103,111 @@ class AuditAiSmellsTests(unittest.TestCase):
         baselined, unapproved = audit_ai_smells.apply_baseline(findings, baseline)
         self.assertEqual(len(baselined), 1)
         self.assertEqual(len(unapproved), 1)
+
+    def test_generated_baseline_json_is_exempt_in_full_and_diff_modes_while_new_code_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "ci@dustbowl.games"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "DustBowl CI"], cwd=repo, check=True, capture_output=True)
+
+            legacy_cs = repo / "Services" / "Legacy.cs"
+            legacy_cs.parent.mkdir(parents=True)
+            legacy_cs.write_text(
+                "// TODO: old ungrounded\n"
+                "// seamless migration\n"
+                "// note \u2014 legacy dash\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "chore: legacy code"], cwd=repo, check=True, capture_output=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_print = audit_ai_smells.main(["--repo-root", str(repo), "--print-baseline"])
+            self.assertEqual(rc_print, 0)
+            baseline_json = buf.getvalue()
+            self.assertNotIn("\u2014", baseline_json)
+            parsed = json.loads(baseline_json)
+            self.assertGreaterEqual(len(parsed["ai_smells_baseline"]), 3)
+
+            baseline_file = repo / "config" / "ai-smells-baseline.json"
+            baseline_file.parent.mkdir(parents=True)
+            baseline_file.write_text(baseline_json, encoding="utf-8")
+
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "chore: add baseline"], cwd=repo, check=True, capture_output=True)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            # Full scan with baseline passes
+            rc_all = audit_ai_smells.main([
+                "--repo-root", str(repo),
+                "--all",
+                "--baseline", "config/ai-smells-baseline.json",
+            ])
+            self.assertEqual(rc_all, 0)
+
+            # Diff mode adding config/ai-smells-baseline.json passes
+            rc_diff = audit_ai_smells.main([
+                "--repo-root", str(repo),
+                "--base", base_sha,
+                "--head", head_sha,
+                "--baseline", "config/ai-smells-baseline.json",
+            ])
+            self.assertEqual(rc_diff, 0)
+
+            # Custom --baseline path outside config/ is also exempt in both --all and diff modes
+            custom_file = repo / "waivers" / "custom.json"
+            custom_file.parent.mkdir(parents=True)
+            custom_file.write_text(baseline_json, encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "chore: add custom baseline"], cwd=repo, check=True, capture_output=True)
+            custom_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            self.assertEqual(
+                audit_ai_smells.main(["--repo-root", str(repo), "--all", "--baseline", "waivers/custom.json"]),
+                0,
+            )
+            self.assertEqual(
+                audit_ai_smells.main([
+                    "--repo-root", str(repo),
+                    "--base", head_sha,
+                    "--head", custom_sha,
+                    "--baseline", "waivers/custom.json",
+                ]),
+                0,
+            )
+
+            # Adding a new violation in code still fails in both modes
+            new_cs = repo / "Services" / "NewService.cs"
+            new_cs.write_text("// seamless new code\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "feat: add new service"], cwd=repo, check=True, capture_output=True)
+            bad_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            rc_bad_all = audit_ai_smells.main([
+                "--repo-root", str(repo),
+                "--all",
+                "--baseline", "waivers/custom.json",
+            ])
+            self.assertEqual(rc_bad_all, 1)
+
+            rc_bad_diff = audit_ai_smells.main([
+                "--repo-root", str(repo),
+                "--base", custom_sha,
+                "--head", bad_sha,
+                "--baseline", "waivers/custom.json",
+            ])
+            self.assertEqual(rc_bad_diff, 1)
 
     def test_self_scan_of_dotgithub_repo_passes_cleanly(self):
         rc = audit_ai_smells.main(["--repo-root", str(ROOT), "--all"])

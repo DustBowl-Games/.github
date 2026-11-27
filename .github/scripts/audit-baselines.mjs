@@ -270,9 +270,11 @@ function main() {
     process.exit(0);
   }
 
-  const targets = pathsArg
+  const discovered = discoverBaselineFiles(repoRoot);
+  const explicit = pathsArg
     ? pathsArg.split(',').map(s => normalizePath(s.trim())).filter(Boolean)
-    : discoverBaselineFiles(repoRoot);
+    : [];
+  const targets = [...new Set([...discovered, ...explicit])].sort();
 
   if (targets.length === 0) {
     console.log('[PASS] No baseline or ignore files to ratchet.');

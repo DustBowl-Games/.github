@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -172,4 +172,109 @@ test('resolveRepoRoot falls back from --repo-root to GITHUB_WORKSPACE to cwd', (
   assert.equal(resolveRepoRoot(['--repo-root', 'sub'], cwd, { GITHUB_WORKSPACE: 'ws' }), path.resolve(cwd, 'sub'));
   assert.equal(resolveRepoRoot([], cwd, { GITHUB_WORKSPACE: 'ws' }), path.resolve(cwd, 'ws'));
   assert.equal(resolveRepoRoot([], cwd, {}), cwd);
+});
+
+test('catches Skip = added inside pre-existing multiline Theory attribute under git diff -U0', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-integrity-skip-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    const testFile = path.join(tmpRepo, 'ExistingTests.cs');
+    fs.writeFileSync(
+      testFile,
+      [
+        'public class ExistingTests {',
+        '  [Theory(',
+        '    DisplayName = "foo")]',
+        '  public void Works() {',
+        '    var q = new Query { Skip = 0 };',
+        '  }',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'test: initial tests']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    // PR adds Skip = "later" inside pre-existing [Theory(...)] without touching [Theory(
+    fs.writeFileSync(
+      testFile,
+      [
+        'public class ExistingTests {',
+        '  [Theory(',
+        '    DisplayName = "foo",',
+        '    Skip = "later")]',
+        '  public void Works() {',
+        '    var q = new Query { Skip = 0 };',
+        '  }',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'test: skip theory']);
+    const headSha = git(['rev-parse', 'HEAD']).trim();
+
+    const failRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', headSha],
+      { encoding: 'utf8' }
+    );
+    assert.notEqual(failRes.status, 0);
+    assert.match(failRes.stderr, /SKIPPED_TEST/);
+
+    // Verify normal Skip = property inside a method body does NOT trigger false positive
+    const benign = auditDiffLines(
+      [
+        '+++ b/ExistingTests.cs',
+        '@@ -5,0 +6,1 @@',
+        '+    var q2 = new Query(Skip = 10);',
+      ].join('\n'),
+      [],
+      '',
+      { repoRoot: tmpRepo }
+    );
+    assert.equal(benign.filter(f => f.ruleId === 'SKIPPED_TEST').length, 0);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test('blocks quoted and expression continue-on-error variants', () => {
+  const diff = [
+    '+++ b/.github/workflows/build.yml',
+    '@@ -10,0 +10,5 @@',
+    "+        continue-on-error: 'true'",
+    '+        continue-on-error: "TRUE"',
+    '+        continue-on-error: ${{ true }}',
+    "+        continue-on-error: '${{ true }}'",
+    "+        continue-on-error: 'false'",
+  ].join('\n');
+
+  const findings = auditDiffLines(diff, [], '');
+  assert.equal(findings.filter(f => f.ruleId === 'CONTINUE_ON_ERROR').length, 4);
+});
+
+test('blocks TreatWarningsAsErrors weakened by commenting it out in XML', () => {
+  const singleLineCommentDiff = [
+    '+++ b/src/App.csproj',
+    '@@ -4,1 +4,1 @@',
+    '-  <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+    '+  <!-- <TreatWarningsAsErrors>true</TreatWarningsAsErrors> -->',
+  ].join('\n');
+  const f1 = auditDiffLines(singleLineCommentDiff, [], '');
+  assert.equal(f1.some(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED'), true);
+
+  const multiLineCommentDiff = [
+    '+++ b/Directory.Build.props',
+    '@@ -4,1 +4,3 @@',
+    '-  <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+    '+  <!--',
+    '+  <TreatWarningsAsErrors>true</TreatWarningsAsErrors>',
+    '+  -->',
+  ].join('\n');
+  const f2 = auditDiffLines(multiLineCommentDiff, [], '');
+  assert.equal(f2.some(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED'), true);
 });

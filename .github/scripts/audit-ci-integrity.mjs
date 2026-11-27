@@ -43,7 +43,7 @@ const SELF_SCRIPT_EXEMPT_RE = /(?:^|\/)\.github\/scripts\/audit-ci-integrity\.mj
 const SINGLE_LINE_SKIP_RE = /\[(?:Skippable)?(?:Fact|Theory)\s*\([^)]*\bSkip\s*=/i;
 const MULTILINE_ATTR_START_RE = /\[(?:Skippable)?(?:Fact|Theory)\s*\(/i;
 const SKIP_ARG_RE = /\bSkip\s*=/i;
-const CONTINUE_ON_ERROR_RE = /^\s*(?:-\s*)?continue-on-error\s*:\s*true(?:\s|$|#)/i;
+const CONTINUE_ON_ERROR_RE = /^\s*(?:-\s*)?continue-on-error\s*:\s*(?:['"]?true['"]?|['"]?\$\{\{\s*true\s*\}\}['"]?)(?:\s|$|#)/i;
 const EXIT_MASK_RE = /\|\|\s*(?:(?:true|exit\s+0)\b|:(?:\s|$|;|&&))|\|\|\s*echo\b[^\n]*::warning::/i;
 
 const TREAT_WARN_TRUE_RE = /<TreatWarningsAsErrors>\s*true\s*<\/TreatWarningsAsErrors>/i;
@@ -110,7 +110,60 @@ function isIgnoredRel(relPath) {
   return parts.slice(0, -1).some(part => IGNORED_DIRS.has(part));
 }
 
-function checkAddedLineRules(relFile, lineNum, text, state, findings) {
+function stripCsStrings(line) {
+  return line.replace(/"(?:\\.|[^"\\])*"/g, '""');
+}
+
+function isInsideMultilineTestAttr(relFile, lineNum, getFileLines) {
+  if (typeof getFileLines !== 'function') return false;
+  const lines = getFileLines(relFile);
+  if (!lines || lineNum < 1 || lineNum > lines.length) return false;
+  const idx = lineNum - 1;
+  const minIdx = Math.max(0, idx - 30);
+  for (let i = idx - 1; i >= minIdx; i--) {
+    const stripped = stripCsStrings(lines[i]);
+    if (MULTILINE_ATTR_START_RE.test(stripped)) {
+      const between = stripCsStrings(lines.slice(i, idx).join('\n'));
+      return !/\)\s*\]/.test(between);
+    }
+    if (/[;\]{}]/.test(stripped)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function stripXmlCommentsInLine(text, state) {
+  let remaining = text;
+  let out = '';
+  while (remaining.length > 0) {
+    if (state.inXmlComment) {
+      const closeIdx = remaining.indexOf('-->');
+      if (closeIdx === -1) {
+        return out;
+      }
+      remaining = remaining.slice(closeIdx + 3);
+      state.inXmlComment = false;
+    } else {
+      const openIdx = remaining.indexOf('<!--');
+      if (openIdx === -1) {
+        out += remaining;
+        break;
+      }
+      out += remaining.slice(0, openIdx);
+      const rest = remaining.slice(openIdx + 4);
+      const closeIdx = rest.indexOf('-->');
+      if (closeIdx === -1) {
+        state.inXmlComment = true;
+        break;
+      }
+      remaining = rest.slice(closeIdx + 3);
+    }
+  }
+  return out;
+}
+
+function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLines = null) {
   const trimmed = text.trim();
 
   if (CS_RE.test(relFile)) {
@@ -148,6 +201,14 @@ function checkAddedLineRules(relFile, lineNum, text, state, findings) {
       } else if (text.includes(')') || text.includes(']')) {
         state.inTestAttr = false;
       }
+    } else if (SKIP_ARG_RE.test(text) && isInsideMultilineTestAttr(relFile, lineNum, getFileLines)) {
+      findings.push({
+        file: relFile,
+        line: lineNum,
+        ruleId: 'SKIPPED_TEST',
+        fingerprint: normalizeFingerprint(text),
+        message: 'Skipped unit test attribute (Skip=) is forbidden.',
+      });
     }
   }
 
@@ -248,47 +309,78 @@ export function applyBaseline(findings, baselineEntries = [], { strict = false }
 
 export function auditDiffLines(diffText, deletedFiles = [], commitText = '', options = {}) {
   const prBody = options.prBody ?? process.env.PR_BODY ?? '';
+  const fileLinesCache = new Map();
+  const getFileLines = (options.readFileText || options.repoRoot)
+    ? relFile => {
+        if (fileLinesCache.has(relFile)) return fileLinesCache.get(relFile);
+        let content = null;
+        if (typeof options.readFileText === 'function') {
+          content = options.readFileText(relFile);
+        } else if (options.repoRoot) {
+          const abs = path.join(options.repoRoot, relFile);
+          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+            content = fs.readFileSync(abs, 'utf8');
+          }
+        }
+        const lines = typeof content === 'string' ? content.split(/\r?\n/) : null;
+        fileLinesCache.set(relFile, lines);
+        return lines;
+      }
+    : null;
+
   const findings = [];
   const treatWarningsTracker = new Map();
   let currentFile = null;
   let currentLine = 0;
   const lineState = { inTestAttr: false };
+  const addXmlState = { inXmlComment: false };
+  const remXmlState = { inXmlComment: false };
 
   for (const raw of diffText.split(/\r?\n/)) {
     if (raw.startsWith('+++ ')) {
       const target = raw.slice(4).trim();
       currentFile = target === '/dev/null' ? null : normalizePath(target.replace(/^b\//, ''));
       lineState.inTestAttr = false;
+      addXmlState.inXmlComment = false;
+      remXmlState.inXmlComment = false;
       continue;
     }
     if (raw.startsWith('--- ')) {
       lineState.inTestAttr = false;
+      addXmlState.inXmlComment = false;
+      remXmlState.inXmlComment = false;
       continue;
     }
     if (raw.startsWith('@@ ')) {
       const m = raw.match(/\+(\d+)/);
       currentLine = m ? Number.parseInt(m[1], 10) : 1;
       lineState.inTestAttr = false;
+      addXmlState.inXmlComment = false;
+      remXmlState.inXmlComment = false;
       continue;
     }
     if (!currentFile || isIgnoredRel(currentFile)) continue;
 
     if (raw.startsWith('-') && !raw.startsWith('---')) {
       const text = raw.slice(1);
-      if (CSPROJ_OR_BUILD_RE.test(currentFile) && TREAT_WARN_TRUE_RE.test(text)) {
-        const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine || 1 };
-        rec.removedTrue += 1;
-        treatWarningsTracker.set(currentFile, rec);
+      if (CSPROJ_OR_BUILD_RE.test(currentFile)) {
+        const uncommented = stripXmlCommentsInLine(text, remXmlState);
+        if (TREAT_WARN_TRUE_RE.test(uncommented)) {
+          const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine || 1 };
+          rec.removedTrue += 1;
+          treatWarningsTracker.set(currentFile, rec);
+        }
       }
       continue;
     }
 
     if (raw.startsWith('+') && !raw.startsWith('+++')) {
       const text = raw.slice(1);
-      checkAddedLineRules(currentFile, currentLine, text, lineState, findings);
+      checkAddedLineRules(currentFile, currentLine, text, lineState, findings, getFileLines);
 
       if (CSPROJ_OR_BUILD_RE.test(currentFile)) {
-        if (TREAT_WARN_FALSE_RE.test(text)) {
+        const uncommented = stripXmlCommentsInLine(text, addXmlState);
+        if (TREAT_WARN_FALSE_RE.test(uncommented)) {
           findings.push({
             file: currentFile,
             line: currentLine,
@@ -297,7 +389,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
             message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
           });
         }
-        if (TREAT_WARN_TRUE_RE.test(text)) {
+        if (TREAT_WARN_TRUE_RE.test(uncommented)) {
           const rec = treatWarningsTracker.get(currentFile) || { removedTrue: 0, addedTrue: 0, line: currentLine };
           rec.addedTrue += 1;
           treatWarningsTracker.set(currentFile, rec);
@@ -308,6 +400,8 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
     } else if (raw.startsWith(' ')) {
       currentLine += 1;
       lineState.inTestAttr = false;
+      addXmlState.inXmlComment = false;
+      remXmlState.inXmlComment = false;
     }
   }
 
@@ -467,7 +561,7 @@ function main() {
     findings = auditRepoFiles(repoRoot);
   } else {
     const { diffText, deletedFiles, commitText } = getGitDiffAndMeta(repoRoot, baseArg, headArg);
-    findings = auditDiffLines(diffText, deletedFiles, commitText);
+    findings = auditDiffLines(diffText, deletedFiles, commitText, { repoRoot });
   }
 
   const { baselined, unapproved } = applyBaseline(findings, baselineEntries, { strict });
