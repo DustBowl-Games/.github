@@ -15,7 +15,31 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-export const REPO_ROOT = path.resolve(__dirname, '../../');
+
+export function resolveRepoRoot(args = process.argv.slice(2), cwd = process.cwd(), env = process.env) {
+  let explicitRoot = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--repo-root') {
+      if (!args[i + 1] || args[i + 1].startsWith('--')) {
+        throw new Error('--repo-root requires a directory path.');
+      }
+      explicitRoot = args[i + 1];
+      break;
+    }
+    if (arg.startsWith('--repo-root=')) {
+      explicitRoot = arg.slice('--repo-root='.length);
+      if (!explicitRoot) {
+        throw new Error('--repo-root= requires a non-empty directory path.');
+      }
+      break;
+    }
+  }
+  const candidate = explicitRoot || env.GITHUB_WORKSPACE || cwd;
+  return path.resolve(cwd, candidate);
+}
+
+export const REPO_ROOT = resolveRepoRoot([], process.cwd(), process.env);
 export const DEFAULT_ALLOWLIST_PATH = path.join(REPO_ROOT, 'config', 'verified-claims-allowlist.json');
 
 export const RULES = [
@@ -53,7 +77,7 @@ export const RULES = [
     ruleId: 'UNAPPROVED_FIBER_OR_LATENCY_CLAIM',
     remediation: 'Remove hardcoded fiber transit or millisecond latency claims unless backed by live telemetry or allowlisted.',
     patterns: [
-      /\b\d+\s*(?:-|–|—|&ndash;|&mdash;)\s*\d+\s*ms\b/i,
+      /\b\d+\s*(?:-|\u2013|\u2014|&ndash;|&mdash;)\s*\d+\s*ms\b/i,
       /\bsub-\d+\s*ms\b/i,
       /(?:<|&lt;|under)\s*\d+\s*ms\b/i,
       /\b(?:direct|carrier|local|regional|dedicated|hickory)\s+(?:carrier\s+|regional\s+)?fiber\b/i,
@@ -388,14 +412,31 @@ export function auditFiles(fileEntries, allowlist, options = {}) {
 
 function main() {
   const args = process.argv.slice(2);
+  let repoRoot;
+  try {
+    repoRoot = resolveRepoRoot(args, process.cwd(), process.env);
+  } catch (err) {
+    console.error(`[FAIL] ${err.message}`);
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(repoRoot) || !fs.statSync(repoRoot).isDirectory()) {
+    console.error(`[FAIL] Repository root directory does not exist: ${repoRoot}`);
+    process.exit(1);
+  }
+
   const scanAll = args.includes('--all');
   const strict = args.includes('--strict');
   const printBaseline = args.includes('--print-baseline');
 
   const allowIdx = args.indexOf('--allowlist');
-  const allowlistPath = allowIdx !== -1 && args[allowIdx + 1]
-    ? path.resolve(process.cwd(), args[allowIdx + 1])
-    : DEFAULT_ALLOWLIST_PATH;
+  const allowEq = args.find(a => a.startsWith('--allowlist='));
+  let allowlistPath = path.join(repoRoot, 'config', 'verified-claims-allowlist.json');
+  if (allowIdx !== -1 && args[allowIdx + 1]) {
+    allowlistPath = path.resolve(process.cwd(), args[allowIdx + 1]);
+  } else if (allowEq) {
+    allowlistPath = path.resolve(process.cwd(), allowEq.slice('--allowlist='.length));
+  }
 
   let allowlist = { schemaVersion: 1, verifiedFacts: [], legacyAuditBaseline: [] };
   if (fs.existsSync(allowlistPath)) {
@@ -413,7 +454,7 @@ function main() {
   }
 
   if (printBaseline) {
-    const files = collectTargetFiles(REPO_ROOT);
+    const files = collectTargetFiles(repoRoot);
     const { unapproved } = auditFiles(files, { ...allowlist, legacyAuditBaseline: [] }, { strict: true });
     const grouped = new Map();
     for (const f of unapproved) {
@@ -442,12 +483,12 @@ function main() {
 
   let result;
   if (scanAll) {
-    const files = collectTargetFiles(REPO_ROOT);
-    console.log(`Auditing ${files.length} public-facing file(s) for unverified factual claims (strict=${strict})...`);
+    const files = collectTargetFiles(repoRoot);
+    console.log(`Auditing ${files.length} public-facing file(s) in ${repoRoot} for unverified factual claims (strict=${strict})...`);
     result = auditFiles(files, allowlist, { strict });
   } else {
-    console.log(`Auditing diff additions for unverified factual claims (strict=${strict})...`);
-    const diffFindings = getDiffAddedLines(REPO_ROOT);
+    console.log(`Auditing diff additions in ${repoRoot} for unverified factual claims (strict=${strict})...`);
+    const diffFindings = getDiffAddedLines(repoRoot);
     result = {
       allFindings: diffFindings,
       ...evaluateFindings(diffFindings, allowlist, { strict }),

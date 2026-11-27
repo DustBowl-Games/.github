@@ -1,6 +1,6 @@
 # DustBowl Games
 
-We build game server communities that last — on infrastructure that actually holds up.
+We build game server communities that last, on infrastructure that actually holds up.
 
 DustBowl Games is a subscription-based platform for serious players. Custom whitelisted servers,
 unique mods, and real DevOps behind everything. We stream the infrastructure work live and
@@ -11,7 +11,7 @@ document it publicly because we have nothing to hide.
 ## The Stack
 
 Our production cluster runs on [Harvester HCI](https://harvesterhci.io/) with
-[RKE2](https://docs.rke2.io/) — 3 control-plane nodes and 3 workers, all on-premise.
+[RKE2](https://docs.rke2.io/): 3 control-plane nodes and 3 workers, all on-premise.
 
 | Layer | Technology |
 |-------|-----------|

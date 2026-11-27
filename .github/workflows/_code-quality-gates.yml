@@ -63,6 +63,56 @@ on:
         required: false
         type: string
         default: ""
+      run_ci_integrity:
+        description: "Block skipped tests, continue-on-error, exit masking, and unapproved suppressions"
+        required: false
+        type: boolean
+        default: true
+      ci_integrity_baseline:
+        description: "Optional JSON baseline path for pre-existing CI integrity waivers"
+        required: false
+        type: string
+        default: ""
+      run_workflow_hygiene:
+        description: "Run actionlint and GitHub Actions workflow contract checks"
+        required: false
+        type: boolean
+        default: true
+      workflow_hygiene_baseline:
+        description: "Optional JSON baseline path for pre-existing workflow hygiene waivers"
+        required: false
+        type: string
+        default: ""
+      run_ai_smells:
+        description: "Run anti-AI-slop, stub, dash, and cleanliness checks"
+        required: false
+        type: boolean
+        default: true
+      ai_smells_mode:
+        description: "Scan mode for anti-slop check: diff or all"
+        required: false
+        type: string
+        default: "diff"
+      ai_smells_baseline:
+        description: "Optional JSON baseline path for pre-existing anti-slop waivers"
+        required: false
+        type: string
+        default: ""
+      allow_markdown_dashes:
+        description: "Allow em/en-dashes in Markdown prose files while still banning them in code/config"
+        required: false
+        type: boolean
+        default: false
+      run_baseline_ratchet:
+        description: "Enforce non-growing baseline and ignore-file ratchet on PRs"
+        required: false
+        type: boolean
+        default: false
+      baseline_paths:
+        description: "Optional comma-separated baseline/ignore paths to ratchet"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -79,112 +129,213 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout org quality gate scripts
+        if: inputs.run_commit_lint || inputs.run_ci_integrity || inputs.run_workflow_hygiene || inputs.run_ai_smells || inputs.run_baseline_ratchet
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: DustBowl-Games/.github
+          path: .org-ci
+          sparse-checkout: |
+            .github/scripts
+            .semgrep
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
       - name: Set up Node.js
-        if: inputs.run_duplication || inputs.run_dead_code || inputs.run_dependency_drift
+        if: inputs.run_duplication || inputs.run_dead_code || inputs.run_dependency_drift || inputs.run_ci_integrity || inputs.run_baseline_ratchet
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
       - name: Conventional Commits & Anti-Slop Linter
         if: inputs.run_commit_lint
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 - <<'PY'
-          import os, re, subprocess, sys
+          args=(--repo-root "$GITHUB_WORKSPACE")
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            args+=(--range "${BASE_SHA}..${HEAD_SHA}")
+          else
+            args+=(--last)
+          fi
+          python3 .org-ci/.github/scripts/verify-commit-msg.py "${args[@]}"
 
-          CC_RE = re.compile(r'^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_\-\.\/]+\))?(!)?: (.+)$')
-          BUZZ_RE = re.compile(r'\b(?:delve|seamless(?:ly)?|tapestry|testament|robust(?:ly)?|leverage|cutting-edge|revolutionary|elevate|game-changer|plethora|multifaceted|holistic|synergy|paradigm|groundbreaking)\b', re.I)
-          WATERMARK_RE = re.compile(r'generated\s+by\s+(?:ai|claude|chatgpt|copilot|gemini|cursor)|co-authored-by:\s*(?:assistant|claude|chatgpt|copilot|gemini)|ai-generated|as\s+an\s+ai\b', re.I)
-
-          event = os.environ.get('GITHUB_EVENT_NAME', '')
-          if event == 'pull_request':
-              base = os.environ.get('BASE_SHA')
-              head = os.environ.get('HEAD_SHA')
-              raw = subprocess.check_output(['git', 'log', f'{base}..{head}', '--pretty=format:%H%x00%B%x00'], text=True)
-              chunks = raw.split('\x00')
-              msgs = [(chunks[i].strip(), chunks[i+1].strip()) for i in range(0, len(chunks)-1, 2) if chunks[i].strip()]
-          else:
-              sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-              body = subprocess.check_output(['git', 'log', '-1', '--pretty=format:%B'], text=True).strip()
-              msgs = [(sha, body)]
-
-          errs = []
-          for sha, body in msgs:
-              lines = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith('#')]
-              if not lines:
-                  errs.append(f'{sha[:8]}: empty commit message')
-                  continue
-              subj = lines[0]
-              if subj.startswith(('Merge branch ', 'Merge remote-tracking branch ', 'Merge pull request #', 'Revert "')):
-                  continue
-              if not CC_RE.match(subj):
-                  errs.append(f'{sha[:8]}: invalid Conventional Commit subject: {subj}')
-              if len(subj) > 72:
-                  errs.append(f'{sha[:8]}: subject exceeds 72 chars ({len(subj)}): {subj}')
-              full = '\n'.join(lines)
-              m = BUZZ_RE.search(full)
-              if m:
-                  errs.append(f'{sha[:8]}: forbidden buzzword "{m.group(0)}"')
-              m = WATERMARK_RE.search(full)
-              if m:
-                  errs.append(f'{sha[:8]}: forbidden AI watermark "{m.group(0)}"')
-
-          if errs:
-              print('[FAIL] Commit lint violations:\n' + '\n'.join('  - ' + e for e in errs), file=sys.stderr)
-              sys.exit(1)
-          print(f'[PASS] {len(msgs)} commit(s) passed Conventional Commits & anti-slop check.')
-          PY
+      - name: CI Integrity & Anti-Bypass Gate
+        if: inputs.run_ci_integrity && github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_INTEGRITY_BASELINE: ${{ inputs.ci_integrity_baseline }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          args=(--repo-root "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA")
+          if [ -n "$CI_INTEGRITY_BASELINE" ]; then
+            args+=(--baseline "$CI_INTEGRITY_BASELINE")
+          fi
+          node .org-ci/.github/scripts/audit-ci-integrity.mjs "${args[@]}"
+
+      - name: Workflow Hygiene & Actionlint Gate
+        if: inputs.run_workflow_hygiene
+        env:
+          WORKFLOW_HYGIENE_BASELINE: ${{ inputs.workflow_hygiene_baseline }}
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          if [ ! -d "$GITHUB_WORKSPACE/.github/workflows" ]; then
+            echo "[INFO] No .github/workflows directory; skipping workflow hygiene."
+            exit 0
+          fi
+
+          bin_dir="$RUNNER_TEMP/bin"
+          mkdir -p "$bin_dir"
+
+          if [ ! -x "$bin_dir/actionlint" ]; then
+            curl -sSfL "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz" \
+              -o "$RUNNER_TEMP/actionlint.tar.gz"
+            echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$bin_dir" actionlint
+            chmod +x "$bin_dir/actionlint"
+          fi
+
+          if [ ! -x "$bin_dir/shellcheck" ]; then
+            curl -sSfL "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz" \
+              -o "$RUNNER_TEMP/shellcheck.tar.xz"
+            echo "${SHELLCHECK_SHA256}  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
+            tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+            mv "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" "$bin_dir/shellcheck"
+            chmod +x "$bin_dir/shellcheck"
+          fi
+
+          export PATH="$bin_dir:$PATH"
+          py_bin="python3"
+          if ! python3 -c "import yaml" >/dev/null 2>&1; then
+            python3 -m venv "$RUNNER_TEMP/wf-yaml-venv"
+            "$RUNNER_TEMP/wf-yaml-venv/bin/pip" install --quiet pyyaml
+            py_bin="$RUNNER_TEMP/wf-yaml-venv/bin/python"
+          fi
+
+          args=(--repo-root "$GITHUB_WORKSPACE" --actionlint-bin "$bin_dir/actionlint")
+          if [ -n "$WORKFLOW_HYGIENE_BASELINE" ]; then
+            args+=(--baseline "$WORKFLOW_HYGIENE_BASELINE")
+          fi
+          "$py_bin" .org-ci/.github/scripts/audit-workflows.py "${args[@]}"
+
+      - name: Anti-AI-Slop & Cleanliness Gate
+        if: inputs.run_ai_smells
+        env:
+          AI_SMELLS_MODE: ${{ inputs.ai_smells_mode }}
+          AI_SMELLS_BASELINE: ${{ inputs.ai_smells_baseline }}
+          ALLOW_MARKDOWN_DASHES: ${{ inputs.allow_markdown_dashes }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          args=(--repo-root "$GITHUB_WORKSPACE")
+          if [ "$AI_SMELLS_MODE" = "all" ]; then
+            args+=(--all)
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+            args+=(--base "$BASE_SHA" --head "$HEAD_SHA")
+          fi
+          if [ "$ALLOW_MARKDOWN_DASHES" = "true" ]; then
+            args+=(--allow-markdown-dashes)
+          fi
+          if [ -n "$AI_SMELLS_BASELINE" ]; then
+            args+=(--baseline "$AI_SMELLS_BASELINE")
+          fi
+          python3 .org-ci/.github/scripts/audit-ai-smells.py "${args[@]}"
+
+      - name: Baseline & Ignore-File Ratchet
+        if: inputs.run_baseline_ratchet && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASELINE_PATHS: ${{ inputs.baseline_paths }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          args=(--repo-root "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA")
+          if [ -n "$BASELINE_PATHS" ]; then
+            args+=(--paths "$BASELINE_PATHS")
+          fi
+          node .org-ci/.github/scripts/audit-baselines.mjs "${args[@]}"
 
       - name: Cyclomatic Complexity Guard (Lizard OSS)
         if: inputs.run_complexity && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_COMPLEXITY: ${{ inputs.max_cyclomatic_complexity }}
         run: |
-          changed=$(git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" -- '*.cs' '*.js' '*.mjs' '*.ts' '*.py' | grep -v '^Migrations/' || true)
-          if [ -z "$changed" ]; then
+          changed=()
+          while IFS= read -r f; do
+            case "$f" in
+              ""|Migrations/*|.org-ci/*) ;;
+              *) changed+=("$f") ;;
+            esac
+          done < <(git diff --name-only --diff-filter=ACMR "${BASE_SHA}...${HEAD_SHA}" -- '*.cs' '*.js' '*.mjs' '*.ts' '*.py')
+
+          if [ "${#changed[@]}" -eq 0 ]; then
             echo "[INFO] No code files changed; skipping complexity check."
             exit 0
           fi
           python3 -m venv "$RUNNER_TEMP/lizard-venv"
           "$RUNNER_TEMP/lizard-venv/bin/pip" install --quiet lizard
-          echo "$changed" | xargs "$RUNNER_TEMP/lizard-venv/bin/lizard" -C "${{ inputs.max_cyclomatic_complexity }}"
+          "$RUNNER_TEMP/lizard-venv/bin/lizard" -C "$MAX_COMPLEXITY" "${changed[@]}"
 
       - name: Duplicate Code Scan (jscpd OSS)
         if: inputs.run_duplication
+        env:
+          DUP_THRESHOLD: ${{ inputs.duplication_threshold }}
+          DUP_PATHS: ${{ inputs.duplication_paths }}
         run: |
-          npx --yes jscpd@4.0.5 --min-lines 15 --min-tokens 80 --threshold "${{ inputs.duplication_threshold }}" --reporters console \
-            --ignore "**/Migrations/**,**/wwwroot/css/**,**/tests/**,**/node_modules/**,**/bin/**,**/obj/**" \
-            ${{ inputs.duplication_paths }}
+          read -r -a dup_paths <<< "$DUP_PATHS"
+          npx --yes jscpd@4.0.5 --min-lines 15 --min-tokens 80 --threshold "$DUP_THRESHOLD" --reporters console \
+            --ignore "**/.org-ci/**,**/Migrations/**,**/wwwroot/css/**,**/tests/**,**/node_modules/**,**/bin/**,**/obj/**" \
+            "${dup_paths[@]}"
 
       - name: NPM Lockfile Integrity & Dead Code Guard (Knip OSS)
         if: inputs.run_dependency_drift || inputs.run_dead_code
+        env:
+          RUN_DEP_DRIFT: ${{ inputs.run_dependency_drift }}
+          RUN_DEAD_CODE: ${{ inputs.run_dead_code }}
         run: |
           if [ ! -f package.json ]; then
             echo "[INFO] No package.json; skipping."
             exit 0
           fi
-          if [ "${{ inputs.run_dependency_drift }}" = "true" ]; then
+          if [ "$RUN_DEP_DRIFT" = "true" ]; then
             npm ci --ignore-scripts
           fi
-          if [ "${{ inputs.run_dead_code }}" = "true" ]; then
+          if [ "$RUN_DEAD_CODE" = "true" ]; then
             npx --yes knip
           fi
 
       - name: PostgreSQL Migration Safety Guard
         if: inputs.run_postgres_migration_guard && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          added=$(git diff --name-only --diff-filter=A "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" -- 'Migrations/*.cs' | grep -v '\.Designer\.cs$' || true)
-          if [ -z "$added" ]; then
+          added=()
+          while IFS= read -r f; do
+            case "$f" in
+              ""|*.Designer.cs) ;;
+              *) added+=("$f") ;;
+            esac
+          done < <(git diff --name-only --diff-filter=A "${BASE_SHA}...${HEAD_SHA}" -- 'Migrations/*.cs')
+
+          if [ "${#added[@]}" -eq 0 ]; then
             echo "[INFO] No new migrations added."
             exit 0
           fi
           fail=0
-          for f in $added; do
+          for f in "${added[@]}"; do
             if grep -iE 'CREATE\s+(UNIQUE\s+)?INDEX\b' "$f" | grep -qiEv '\bCONCURRENTLY\b'; then
               echo "::error file=$f::Non-concurrent CREATE INDEX detected; use CONCURRENTLY."
               fail=1
@@ -200,4 +351,6 @@ jobs:
 
       - name: Lint Helm Chart
         if: inputs.run_k8s_helm_lint && inputs.helm_chart_dir != ''
-        run: helm lint "${{ inputs.helm_chart_dir }}"
+        env:
+          HELM_CHART_DIR: ${{ inputs.helm_chart_dir }}
+        run: helm lint "$HELM_CHART_DIR"

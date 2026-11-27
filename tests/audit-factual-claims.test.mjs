@@ -1,10 +1,20 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   auditText,
   evaluateFindings,
+  resolveRepoRoot,
   validateAllowlist,
 } from '../.github/scripts/audit-factual-claims.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SCRIPT_PATH = path.resolve(__dirname, '../.github/scripts/audit-factual-claims.mjs');
 
 test('detects all 6 unapproved claim rule categories on realistic public copy', () => {
   const sample = [
@@ -74,7 +84,7 @@ test('validateAllowlist enforces required metadata fields', () => {
 
 test('verifiedFacts allowlist only matches exact file + ruleId + match, and legacy baseline blocks copy-paste growth', () => {
   const copy = [
-    '<p>"24/7 monitoring with honest, best-effort human support â€” no fake \\"24/7\\" promise"</p>',
+    '<p>"24/7 monitoring with honest, best-effort human support - no fake \\"24/7\\" promise"</p>',
     '<p>Same Business Day</p>',
   ].join('\n');
 
@@ -121,4 +131,85 @@ test('verifiedFacts allowlist only matches exact file + ruleId + match, and lega
   const cleaned = auditText('<p>We reply during EST hours.</p>', 'Components/Shared/HostComparisonTable.razor');
   const resClean = evaluateFindings(cleaned, allowlist, { strict: false });
   assert.equal(resClean.unapproved.length, 0);
+});
+
+test('resolveRepoRoot prefers --repo-root, then GITHUB_WORKSPACE, then cwd', () => {
+  const cwd = path.resolve('a', 'b');
+  assert.equal(
+    resolveRepoRoot(['--repo-root', '/tmp/caller'], cwd, { GITHUB_WORKSPACE: '/tmp/ws' }),
+    path.resolve(cwd, '/tmp/caller')
+  );
+  assert.equal(
+    resolveRepoRoot(['--repo-root=/tmp/eq-caller'], cwd, { GITHUB_WORKSPACE: '/tmp/ws' }),
+    path.resolve(cwd, '/tmp/eq-caller')
+  );
+  assert.equal(
+    resolveRepoRoot([], cwd, { GITHUB_WORKSPACE: '/tmp/ws' }),
+    path.resolve(cwd, '/tmp/ws')
+  );
+  assert.equal(resolveRepoRoot([], cwd, {}), cwd);
+});
+
+test('CLI scans caller workspace via --repo-root and GITHUB_WORKSPACE even when invoked from simulated .org-ci directory', () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-gate-test-'));
+  try {
+    const callerWs = path.join(tmpBase, 'caller-workspace');
+    const orgCiDir = path.join(callerWs, '.org-ci', '.github', 'scripts');
+    fs.mkdirSync(orgCiDir, { recursive: true });
+    fs.copyFileSync(SCRIPT_PATH, path.join(orgCiDir, 'audit-factual-claims.mjs'));
+
+    const pagesDir = path.join(callerWs, 'Components', 'Pages');
+    const cfgDir = path.join(callerWs, 'config');
+    fs.mkdirSync(pagesDir, { recursive: true });
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(cfgDir, 'verified-claims-allowlist.json'),
+      JSON.stringify({ schemaVersion: 1, verifiedFacts: [], legacyAuditBaseline: [] }, null, 2)
+    );
+
+    const razorPath = path.join(pagesDir, 'Pricing.razor');
+    fs.writeFileSync(razorPath, '<p>We offer a 99.9% uptime guarantee and 24/7 support.</p>\n');
+
+    const copiedScript = path.join(orgCiDir, 'audit-factual-claims.mjs');
+
+    // Negative: explicit --repo-root catches violation inside caller workspace
+    const negExplicit = spawnSync(
+      process.execPath,
+      [copiedScript, '--repo-root', callerWs, '--allowlist', path.join(cfgDir, 'verified-claims-allowlist.json'), '--all'],
+      { cwd: orgCiDir, env: { ...process.env, GITHUB_WORKSPACE: '' }, encoding: 'utf8' }
+    );
+    assert.notEqual(negExplicit.status, 0);
+    assert.match(negExplicit.stderr, /UNAPPROVED_SLA_PERCENT/);
+    assert.match(negExplicit.stderr, /UNAPPROVED_24_7_CLAIM/);
+
+    // Negative: GITHUB_WORKSPACE fallback catches violation without --repo-root
+    const negEnv = spawnSync(
+      process.execPath,
+      [copiedScript, '--all'],
+      { cwd: orgCiDir, env: { ...process.env, GITHUB_WORKSPACE: callerWs }, encoding: 'utf8' }
+    );
+    assert.notEqual(negEnv.status, 0);
+    assert.match(negEnv.stderr, /UNAPPROVED_SLA_PERCENT/);
+
+    // Negative: non-existent --repo-root fails loudly
+    const missingDir = spawnSync(
+      process.execPath,
+      [copiedScript, '--repo-root', path.join(tmpBase, 'does-not-exist'), '--all'],
+      { cwd: orgCiDir, encoding: 'utf8' }
+    );
+    assert.notEqual(missingDir.status, 0);
+    assert.match(missingDir.stderr, /does not exist/);
+
+    // Positive: clean copy passes with exit 0
+    fs.writeFileSync(razorPath, '<p>Game server hosting on bare-metal hardware in Hickory, NC.</p>\n');
+    const posRes = spawnSync(
+      process.execPath,
+      [copiedScript, `--repo-root=${callerWs}`, '--all'],
+      { cwd: orgCiDir, env: { ...process.env, GITHUB_WORKSPACE: '' }, encoding: 'utf8' }
+    );
+    assert.equal(posRes.status, 0, posRes.stderr);
+    assert.match(posRes.stdout, /Auditing 1 public-facing file\(s\)/);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
 });
