@@ -1,0 +1,153 @@
+rules:
+  # 1. Ban silent exception swallowing
+  - id: csharp-antislop-empty-catch
+    languages: [csharp]
+    message: "AI Anti-Pattern: Empty catch block silently swallows exceptions. Log the error or handle specific exceptions."
+    severity: ERROR
+    pattern-either:
+      - pattern: |
+          try {
+            ...
+          } catch ($E) {
+          }
+      - pattern: |
+          try {
+            ...
+          } catch ($T $E) {
+          }
+      - pattern: |
+          try {
+            ...
+          } catch {
+          }
+
+  # 2. Ban Thread.Sleep in asynchronous methods
+  - id: csharp-antislop-sync-sleep-in-async
+    languages: [csharp]
+    message: "AI Anti-Pattern: Using synchronous Thread.Sleep inside async method blocks thread pool. Use await Task.Delay()."
+    severity: ERROR
+    patterns:
+      - pattern-inside:
+          pattern-either:
+            - pattern: |
+                async Task $FUNC(...) {
+                  ...
+                }
+            - pattern: |
+                async Task<$T> $FUNC(...) {
+                  ...
+                }
+            - pattern: |
+                async ValueTask $FUNC(...) {
+                  ...
+                }
+            - pattern: |
+                async ValueTask<$T> $FUNC(...) {
+                  ...
+                }
+            - pattern: |
+                async void $FUNC(...) {
+                  ...
+                }
+      - pattern: Thread.Sleep(...);
+
+  # 3. Ban trivial unit test assertions (Code Theater)
+  - id: csharp-antislop-tautological-test
+    languages: [csharp]
+    message: "AI Anti-Pattern: Tautological assertion detected (asserting true is true). Tests must verify real state mutations or business logic."
+    severity: ERROR
+    pattern-either:
+      - pattern: Assert.True(true);
+      - pattern: Assert.False(false);
+      - pattern: Assert.Equal($X, $X);
+
+  # 4. Ban disabled SSL / TLS certificate validation
+  - id: csharp-antislop-disable-ssl-cert-validation
+    languages: [csharp]
+    message: "Security Defect: SSL/TLS certificate validation has been completely disabled. Never bypass server certificate validation."
+    severity: ERROR
+    pattern-either:
+      - pattern: |
+          ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+      - pattern: |
+          ServerCertificateCustomValidationCallback = ($A, $B, $C, $D) => true;
+
+  # 5. TypeScript: Ban 'any' casts
+  - id: ts-antislop-no-explicit-any
+    languages: [typescript]
+    message: "AI Anti-Pattern: Casting to 'any' undermines type safety. Define proper domain types or use 'unknown' with type narrowing."
+    severity: WARNING
+    pattern: |
+      ($X as any)
+
+  # 6. C#: Ban raw Console.WriteLine in production services (enforce ILogger)
+  - id: csharp-antislop-no-console-write
+    languages: [csharp]
+    message: "Code Hygiene: Raw Console.WriteLine / Console.Error.WriteLine is banned in production services. Inject and use ILogger<T> for structured logging."
+    severity: ERROR
+    paths:
+      include:
+        - "**/Services/**"
+    pattern-either:
+      - pattern: System.Console.WriteLine(...);
+      - pattern: Console.WriteLine(...);
+      - pattern: System.Console.Write(...);
+      - pattern: Console.Write(...);
+
+  # 7. C#: Ban sync-over-async blocking calls (.Result / .Wait() / .GetAwaiter().GetResult())
+  - id: csharp-antislop-sync-over-async
+    languages: [csharp]
+    message: "AI Anti-Pattern: Blocking on async Task with .Result, .Wait(), or .GetAwaiter().GetResult() risks deadlocks and thread starvation. Use await."
+    severity: ERROR
+    pattern-either:
+      - pattern: $EXPR.GetAwaiter().GetResult()
+      - pattern: $EXPR.Wait()
+      - pattern: $OBJ.$METHOD(...).Result
+      - patterns:
+          - pattern-inside:
+              pattern-either:
+                - pattern: |
+                    async Task $FUNC(...) {
+                      ...
+                    }
+                - pattern: |
+                    async Task<$T> $FUNC(...) {
+                      ...
+                    }
+                - pattern: |
+                    async ValueTask $FUNC(...) {
+                      ...
+                    }
+                - pattern: |
+                    async ValueTask<$T> $FUNC(...) {
+                      ...
+                    }
+                - pattern: |
+                    async void $FUNC(...) {
+                      ...
+                    }
+          - pattern: $TASK.Result
+
+  # 8. C#: Ban raw new HttpClient() inside Services (use IHttpClientFactory)
+  - id: csharp-antislop-raw-httpclient
+    languages: [csharp]
+    message: "Resource Safety: Constructing raw HttpClient inside Services causes socket exhaustion and stale DNS. Inject IHttpClientFactory."
+    severity: ERROR
+    paths:
+      include:
+        - "**/Services/**"
+    pattern-either:
+      - pattern: new HttpClient(...)
+      - pattern: new System.Net.Http.HttpClient(...)
+
+  # 9. C#: Ban non-literal MarkupString construction (XSS risk)
+  - id: csharp-antislop-raw-markupstring
+    languages: [csharp]
+    message: "Security Defect: Constructing MarkupString from a non-literal expression risks XSS. Sanitize HTML or render structured Razor markup."
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: new MarkupString($ARG)
+          - pattern: new Microsoft.AspNetCore.Components.MarkupString($ARG)
+      - pattern-not: new MarkupString("...")
+      - pattern-not: new Microsoft.AspNetCore.Components.MarkupString("...")

@@ -43,10 +43,35 @@ on:
         type: boolean
         default: true
       fail_on_vulnerable_nuget:
-        description: "Fail build if High or Critical NuGet vulnerabilities are detected"
+        description: "Fail build if NuGet vulnerabilities at or above nuget_audit_level are detected"
         required: false
         type: boolean
         default: true
+      run_format_check:
+        description: "Run dotnet format --verify-no-changes"
+        required: false
+        type: boolean
+        default: false
+      nuget_audit_level:
+        description: "Minimum NuGetAudit vulnerability severity (low, moderate, high, critical)"
+        required: false
+        type: string
+        default: "high"
+      treat_warnings_as_errors:
+        description: "Pass -p:TreatWarningsAsErrors=true to dotnet build"
+        required: false
+        type: boolean
+        default: false
+      warning_level:
+        description: "Optional MSBuild WarningLevel property (e.g. 9999)"
+        required: false
+        type: string
+        default: ""
+      enforce_code_style:
+        description: "Pass -p:EnforceCodeStyleInBuild=true to dotnet build"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,9 +94,11 @@ jobs:
         run: |
           job_temp="$RUNNER_TEMP/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
           mkdir -p "$job_temp"
-          echo "DOTNET_JOB_TEMP=$job_temp" >> "$GITHUB_ENV"
-          echo "DOTNET_CLI_HOME=$job_temp/dotnet-cli-home" >> "$GITHUB_ENV"
-          echo "NUGET_PACKAGES=$job_temp/nuget-packages" >> "$GITHUB_ENV"
+          {
+            echo "DOTNET_JOB_TEMP=$job_temp"
+            echo "DOTNET_CLI_HOME=$job_temp/dotnet-cli-home"
+            echo "NUGET_PACKAGES=$job_temp/nuget-packages"
+          } >> "$GITHUB_ENV"
 
       - name: Set up .NET
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
@@ -79,26 +106,82 @@ jobs:
           dotnet-version: ${{ inputs.dotnet_version }}
 
       - name: Restore & Build
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          NUGET_AUDIT_LEVEL: ${{ inputs.nuget_audit_level }}
+          FAIL_ON_VULN: ${{ inputs.fail_on_vulnerable_nuget }}
+          TREAT_WARNINGS_AS_ERRORS: ${{ inputs.treat_warnings_as_errors }}
+          WARNING_LEVEL: ${{ inputs.warning_level }}
+          ENFORCE_CODE_STYLE: ${{ inputs.enforce_code_style }}
         run: |
-          dotnet restore "${{ inputs.project_path }}"
-          dotnet build "${{ inputs.project_path }}" -c Release --no-restore
+          set -euo pipefail
+          audit_level="${NUGET_AUDIT_LEVEL,,}"
+          case "$audit_level" in
+            low) nu_codes="NU1901;NU1902;NU1903;NU1904" ;;
+            moderate) nu_codes="NU1902;NU1903;NU1904" ;;
+            high) nu_codes="NU1903;NU1904" ;;
+            critical) nu_codes="NU1904" ;;
+            *)
+              echo "::error::Invalid nuget_audit_level '$NUGET_AUDIT_LEVEL' (expected low, moderate, high, or critical)."
+              exit 1
+              ;;
+          esac
+
+          restore_args=(-p:NuGetAudit=true -p:NuGetAuditMode=all "-p:NuGetAuditLevel=$audit_level")
+          build_args=(-c Release --no-restore -p:NuGetAudit=true -p:NuGetAuditMode=all "-p:NuGetAuditLevel=$audit_level")
+
+          if [ "$FAIL_ON_VULN" = "true" ]; then
+            restore_args+=("-warnaserror:$nu_codes")
+            build_args+=("-warnaserror:$nu_codes")
+          fi
+          if [ "$TREAT_WARNINGS_AS_ERRORS" = "true" ]; then
+            build_args+=(-p:TreatWarningsAsErrors=true)
+          fi
+          if [ -n "$WARNING_LEVEL" ]; then
+            build_args+=("-p:WarningLevel=$WARNING_LEVEL")
+          fi
+          if [ "$ENFORCE_CODE_STYLE" = "true" ]; then
+            build_args+=(-p:EnforceCodeStyleInBuild=true)
+          fi
+
+          dotnet restore "$PROJECT_PATH" "${restore_args[@]}"
+          dotnet build "$PROJECT_PATH" "${build_args[@]}"
+
+      - name: Verify Code Formatting
+        if: inputs.run_format_check
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+        run: dotnet format "$PROJECT_PATH" --verify-no-changes --no-restore
 
       - name: Check Vulnerable NuGet Packages
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          FAIL_ON_VULN: ${{ inputs.fail_on_vulnerable_nuget }}
+          NUGET_AUDIT_LEVEL: ${{ inputs.nuget_audit_level }}
         run: |
-          if [ "${{ inputs.fail_on_vulnerable_nuget }}" = "true" ]; then
-            out=$(dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive)
-            echo "$out"
-            if echo "$out" | grep -qiE '\b(High|Critical)\b'; then
-              echo "::error::High or Critical NuGet vulnerabilities detected."
+          set -euo pipefail
+          out=$(dotnet list "$PROJECT_PATH" package --vulnerable --include-transitive)
+          echo "$out"
+          if [ "$FAIL_ON_VULN" = "true" ]; then
+            audit_level="${NUGET_AUDIT_LEVEL,,}"
+            case "$audit_level" in
+              low) sev_re='\b(Low|Moderate|High|Critical)\b' ;;
+              moderate) sev_re='\b(Moderate|High|Critical)\b' ;;
+              high) sev_re='\b(High|Critical)\b' ;;
+              critical) sev_re='\bCritical\b' ;;
+              *) sev_re='\b(High|Critical)\b' ;;
+            esac
+            if echo "$out" | grep -qiE "$sev_re"; then
+              echo "::error::NuGet vulnerabilities at or above '$audit_level' detected."
               exit 1
             fi
-          else
-            dotnet list "${{ inputs.project_path }}" package --vulnerable --include-transitive || true
           fi
 
       - name: Test
         if: inputs.run_tests
-        run: dotnet test "${{ inputs.project_path }}" -c Release --no-build
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+        run: dotnet test "$PROJECT_PATH" -c Release --no-build
 
       - name: Restore workspace ownership
         if: always()
@@ -119,7 +202,9 @@ jobs:
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.15.0
-      - run: helm lint "${{ inputs.helm_chart_path }}"
+      - env:
+          HELM_CHART_PATH: ${{ inputs.helm_chart_path }}
+        run: helm lint "$HELM_CHART_PATH"
 
   package-and-sbom:
     name: Container Build, Scan & Publish
@@ -136,32 +221,29 @@ jobs:
           persist-credentials: false
 
       - name: Build Container Image
-        run: docker build -t "${{ inputs.image_name }}:pr-check" .
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+        run: docker build -t "${IMAGE_NAME}:pr-check" .
 
       - name: Trivy Container Scan (CRITICAL/HIGH, OSS)
         env:
           TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+          IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           mkdir -p "$RUNNER_TEMP/docker-anon"
-          ignore_mount=""
-          ignore_arg=""
+          docker_args=(--rm --volume /var/run/docker.sock:/var/run/docker.sock)
+          trivy_args=(image --severity "CRITICAL,HIGH" --ignore-unfixed --exit-code 1)
           if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
-            ignore_mount="--volume $GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro"
-            ignore_arg="--ignorefile /.trivyignore"
+            docker_args+=(--volume "$GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro")
+            trivy_args+=(--ignorefile /.trivyignore)
           fi
-          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
-            --volume /var/run/docker.sock:/var/run/docker.sock \
-            $ignore_mount \
-            "$TRIVY_IMAGE" image \
-            --severity "CRITICAL,HIGH" \
-            --ignore-unfixed \
-            $ignore_arg \
-            --exit-code 1 \
-            "${{ inputs.image_name }}:pr-check"
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run "${docker_args[@]}" \
+            "$TRIVY_IMAGE" "${trivy_args[@]}" "${IMAGE_NAME}:pr-check"
 
       - name: Generate CycloneDX SBOM (OSS)
         env:
           TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+          IMAGE_NAME: ${{ inputs.image_name }}
         run: |
           mkdir -p "$RUNNER_TEMP/docker-anon"
           DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
@@ -170,7 +252,7 @@ jobs:
             "$TRIVY_IMAGE" image \
             --format cyclonedx \
             --output /out/sbom.cdx.json \
-            "${{ inputs.image_name }}:pr-check"
+            "${IMAGE_NAME}:pr-check"
 
       - name: Upload SBOM Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

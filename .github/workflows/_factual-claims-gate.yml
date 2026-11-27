@@ -58,7 +58,7 @@ jobs:
           STRICT_MODE: ${{ inputs.strict }}
           SCAN_ALL: ${{ inputs.scan_all }}
         run: |
-          args=(--allowlist "$GITHUB_WORKSPACE/$ALLOWLIST_PATH")
+          args=(--repo-root "$GITHUB_WORKSPACE" --allowlist "$GITHUB_WORKSPACE/$ALLOWLIST_PATH")
           if [ "$SCAN_ALL" = "true" ]; then args+=(--all); fi
           if [ "$STRICT_MODE" = "true" ]; then args+=(--strict); fi
           node .org-ci/.github/scripts/audit-factual-claims.mjs "${args[@]}"

@@ -24,7 +24,7 @@ on:
         type: boolean
         default: true
       semgrep_config:
-        description: "Semgrep OSS ruleset (local path or p/security-audit)"
+        description: "Semgrep OSS ruleset(s) (comma/space separated local path or p/security-audit)"
         required: false
         type: string
         default: "p/security-audit"
@@ -33,11 +33,36 @@ on:
         required: false
         type: boolean
         default: false
+      semgrep_baseline_commit:
+        description: "Optional git commit/ref for Semgrep --baseline-commit (or 'auto' for PR base SHA)"
+        required: false
+        type: string
+        default: ""
       check_dockerfile:
-        description: "Verify Dockerfile enforces non-root USER and bans :latest base tags"
+        description: "Verify Dockerfiles enforce non-root final USER and safe instructions"
         required: false
         type: boolean
         default: true
+      require_pinned_digest:
+        description: "Require @sha256 image digests in Dockerfile FROM instructions"
+        required: false
+        type: boolean
+        default: false
+      check_k8s_helm:
+        description: "Scan Kubernetes manifests and Helm charts for unsafe security contexts and plaintext TLS"
+        required: false
+        type: boolean
+        default: false
+      helm_chart_dir:
+        description: "Optional Helm chart or Kubernetes manifest directory"
+        required: false
+        type: string
+        default: ""
+      baseline_file:
+        description: "Optional JSON baseline file for infrastructure safety waivers"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -54,6 +79,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout org security gate assets
+        if: inputs.run_semgrep || inputs.check_dockerfile || inputs.check_k8s_helm
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: DustBowl-Games/.github
+          path: .org-ci
+          sparse-checkout: |
+            .semgrep/antislop-rules.yml
+            .github/scripts/audit-infra-safety.py
+            .github/scripts/merge-semgrep-rules.py
+          persist-credentials: false
+
       - name: Run Gitleaks Secret Scan (OSS)
         env:
           GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f # v8.30.1
@@ -66,80 +103,141 @@ jobs:
       - name: Run Trivy Filesystem & IaC Scan (OSS)
         env:
           TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+          FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
         run: |
           mkdir -p "$RUNNER_TEMP/docker-anon"
-          ignore_arg=""
+          trivy_args=(fs --scanners "vuln,misconfig" --severity "$FAIL_ON_SEVERITY" --ignore-unfixed --exit-code 1)
           if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
-            ignore_arg="--ignorefile /repo/.trivyignore"
+            trivy_args+=(--ignorefile /repo/.trivyignore)
           fi
           DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
             --volume "$GITHUB_WORKSPACE:/repo" \
-            "$TRIVY_IMAGE" fs \
-            --scanners vuln,misconfig \
-            --severity "${{ inputs.fail_on_severity }}" \
-            --ignore-unfixed \
-            $ignore_arg \
-            --exit-code 1 \
-            /repo
+            "$TRIVY_IMAGE" "${trivy_args[@]}" /repo
 
       - name: Run Trivy Container Image Scan (OSS)
         if: inputs.image_ref != ''
         env:
           TRIVY_IMAGE: aquasec/trivy:0.58.1@sha256:de81be41be9665a7b761680cd4bb570313a923154b994c79b49b5a55f1a55e35
+          FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
+          IMAGE_REF: ${{ inputs.image_ref }}
         run: |
           mkdir -p "$RUNNER_TEMP/docker-anon"
-          ignore_mount=""
-          ignore_arg=""
+          docker_args=(--rm --volume /var/run/docker.sock:/var/run/docker.sock)
+          trivy_args=(image --severity "$FAIL_ON_SEVERITY" --ignore-unfixed --exit-code 1)
           if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
-            ignore_mount="--volume $GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro"
-            ignore_arg="--ignorefile /.trivyignore"
+            docker_args+=(--volume "$GITHUB_WORKSPACE/.trivyignore:/.trivyignore:ro")
+            trivy_args+=(--ignorefile /.trivyignore)
           fi
-          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run --rm \
-            --volume /var/run/docker.sock:/var/run/docker.sock \
-            $ignore_mount \
-            "$TRIVY_IMAGE" image \
-            --severity "${{ inputs.fail_on_severity }}" \
-            --ignore-unfixed \
-            $ignore_arg \
-            --exit-code 1 \
-            "${{ inputs.image_ref }}"
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-anon" docker run "${docker_args[@]}" \
+            "$TRIVY_IMAGE" "${trivy_args[@]}" "$IMAGE_REF"
 
-      - name: Set up Python for Semgrep OSS
-        if: inputs.run_semgrep
+      - name: Set up Python for Semgrep & Infra Safety
+        if: inputs.run_semgrep || inputs.check_dockerfile || inputs.check_k8s_helm
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
       - name: Run Semgrep OSS SAST
         if: inputs.run_semgrep
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep_config }}
+          SEMGREP_BLOCKING: ${{ inputs.semgrep_blocking }}
+          SEMGREP_BASELINE_COMMIT: ${{ inputs.semgrep_baseline_commit }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/semgrep-venv"
-          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep
-          cfg="${{ inputs.semgrep_config }}"
-          if [ -f ".semgrep/antislop-rules.yml" ]; then
-            cfg=".semgrep/antislop-rules.yml"
-          fi
-          if [ "${{ inputs.semgrep_blocking }}" = "true" ]; then
-            "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan --metrics=off --config "$cfg" --error --severity ERROR --quiet .
-          else
-            "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan --metrics=off --config "$cfg" --quiet . || echo "::warning::Semgrep reported advisory findings"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet semgrep pyyaml
+
+          cfg_args=()
+          for token in ${SEMGREP_CONFIG//,/ }; do
+            if [ -n "$token" ]; then
+              cfg_args+=(--config "$token")
+            fi
+          done
+
+          org_rules=".org-ci/.semgrep/antislop-rules.yml"
+          caller_rules=".semgrep/antislop-rules.yml"
+          if [ -f "$caller_rules" ] && [ -f "$org_rules" ]; then
+            if cmp -s "$org_rules" "$caller_rules"; then
+              cfg_args+=(--config "$caller_rules")
+            else
+              merged_org="$RUNNER_TEMP/org-antislop-nonoverlapping.yml"
+              rm -f "$merged_org"
+              "$RUNNER_TEMP/semgrep-venv/bin/python" .org-ci/.github/scripts/merge-semgrep-rules.py \
+                --org "$org_rules" \
+                --caller "$caller_rules" \
+                --out "$merged_org"
+              if [ -s "$merged_org" ]; then
+                cfg_args+=(--config "$merged_org")
+              fi
+              cfg_args+=(--config "$caller_rules")
+            fi
+          elif [ -f "$caller_rules" ]; then
+            cfg_args+=(--config "$caller_rules")
+          elif [ -f "$org_rules" ]; then
+            cfg_args+=(--config "$org_rules")
           fi
 
-      - name: Check Dockerfile Hardening
-        if: inputs.check_dockerfile
+          if [ "${#cfg_args[@]}" -eq 0 ]; then
+            echo "::error::No Semgrep rulesets resolved."
+            exit 1
+          fi
+
+          scan_args=(scan --metrics=off "${cfg_args[@]}" --exclude ".org-ci" --quiet)
+
+          base_sha="$SEMGREP_BASELINE_COMMIT"
+          if [ "$base_sha" = "auto" ]; then
+            if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
+              base_sha="$PR_BASE_SHA"
+            else
+              base_sha=""
+            fi
+          fi
+          if [ -n "$base_sha" ]; then
+            if ! git rev-parse --verify "$base_sha" >/dev/null 2>&1; then
+              if ! git fetch --no-tags --depth=1 origin "$base_sha" >/dev/null 2>&1; then
+                echo "[INFO] Unable to resolve Semgrep baseline commit '$base_sha'; scanning full tree."
+                base_sha=""
+              fi
+            fi
+            if [ -n "$base_sha" ]; then
+              scan_args+=(--baseline-commit "$base_sha")
+            fi
+          fi
+
+          if [ "$SEMGREP_BLOCKING" = "true" ]; then
+            scan_args+=(--error --severity ERROR)
+          fi
+
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" "${scan_args[@]}" .
+
+      - name: Check Dockerfile & K8s/Helm Safety
+        if: inputs.check_dockerfile || inputs.check_k8s_helm
+        env:
+          CHECK_DOCKERFILE: ${{ inputs.check_dockerfile }}
+          REQUIRE_PINNED_DIGEST: ${{ inputs.require_pinned_digest }}
+          CHECK_K8S_HELM: ${{ inputs.check_k8s_helm }}
+          HELM_CHART_DIR: ${{ inputs.helm_chart_dir }}
+          BASELINE_FILE: ${{ inputs.baseline_file }}
         run: |
-          if [ ! -f Dockerfile ]; then
-            echo "[INFO] No Dockerfile found; skipping."
-            exit 0
+          infra_args=(--repo-root "$GITHUB_WORKSPACE")
+          if [ "$CHECK_DOCKERFILE" = "true" ]; then
+            infra_args+=(--check-dockerfile)
+          else
+            infra_args+=(--no-dockerfile)
           fi
-          if grep -iE '^FROM\s+.*:latest(\s|$)' Dockerfile; then
-            echo "::error::Dockerfile uses banned :latest base image tag."
-            exit 1
+          if [ "$REQUIRE_PINNED_DIGEST" = "true" ]; then
+            infra_args+=(--require-pinned-digest)
           fi
-          last_user=$(grep -iE '^USER\s+' Dockerfile | tail -n 1 | awk '{print $2}' || true)
-          if [ -z "$last_user" ] || [ "$last_user" = "root" ] || [ "$last_user" = "0" ]; then
-            echo "::error::Dockerfile must end with a non-root USER instruction."
-            exit 1
+          if [ "$CHECK_K8S_HELM" = "true" ]; then
+            infra_args+=(--check-k8s-helm)
           fi
-          echo "[PASS] Dockerfile hardening check passed (USER $last_user)."
+          if [ -n "$HELM_CHART_DIR" ]; then
+            infra_args+=(--helm-chart-dir "$HELM_CHART_DIR")
+          fi
+          if [ -n "$BASELINE_FILE" ]; then
+            infra_args+=(--baseline "$BASELINE_FILE")
+          fi
+          python3 .org-ci/.github/scripts/audit-infra-safety.py "${infra_args[@]}"
