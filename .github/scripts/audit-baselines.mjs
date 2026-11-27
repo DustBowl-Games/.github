@@ -150,7 +150,14 @@ function buildJsonCountMap(arr) {
       total += 1;
       continue;
     }
-    const count = Number.isInteger(item.count) && item.count > 0 ? item.count : 1;
+    let count;
+    if (item.count === undefined) {
+      count = 1;
+    } else if (Number.isInteger(item.count) && item.count >= 0) {
+      count = item.count;
+    } else {
+      throw new Error(`Invalid baseline item.count ${JSON.stringify(item.count)} (must be a non-negative integer).`);
+    }
     const hasKeyFields = item.file !== undefined || item.ruleId !== undefined || item.fingerprint !== undefined;
     const key = hasKeyFields
       ? `${normalizePath(String(item.file || ''))}|${String(item.ruleId || '')}|${normalizeFingerprint(item.fingerprint || '')}`
@@ -168,35 +175,61 @@ export function compareJsonBaselines(baseRaw, headRaw, relFile) {
 
   if (Array.isArray(headDoc)) {
     const baseArr = Array.isArray(baseDoc) ? baseDoc : [];
-    const { map: bMap, total: bTotal } = buildJsonCountMap(baseArr);
-    const { map: hMap, total: hTotal } = buildJsonCountMap(headDoc);
-    if (hTotal > bTotal) {
-      errors.push(`${relFile}: baseline total grew from ${bTotal} to ${hTotal}`);
-    }
-    for (const [k, hCnt] of hMap.entries()) {
-      const bCnt = bMap.get(k) || 0;
-      if (hCnt > bCnt) {
-        errors.push(`${relFile}: baseline entry grew or was swapped in (${k}: ${bCnt} -> ${hCnt})`);
+    try {
+      const { map: bMap, total: bTotal } = buildJsonCountMap(baseArr);
+      const { map: hMap, total: hTotal } = buildJsonCountMap(headDoc);
+      if (hTotal > bTotal) {
+        errors.push(`${relFile}: baseline total grew from ${bTotal} to ${hTotal}`);
       }
+      for (const [k, hCnt] of hMap.entries()) {
+        const bCnt = bMap.get(k) || 0;
+        if (hCnt > bCnt) {
+          errors.push(`${relFile}: baseline entry grew or was swapped in (${k}: ${bCnt} -> ${hCnt})`);
+        }
+      }
+    } catch (err) {
+      errors.push(`${relFile}: ${err.message}`);
     }
     return errors;
+  }
+
+  if (headDoc && typeof headDoc === 'object' && headDoc.count !== undefined) {
+    if (!Number.isInteger(headDoc.count) || headDoc.count < 0) {
+      errors.push(`${relFile}: invalid top-level count ${JSON.stringify(headDoc.count)} (must be a non-negative integer).`);
+    } else {
+      let baseCount = 0;
+      if (baseDoc && typeof baseDoc === 'object' && !Array.isArray(baseDoc) && baseDoc.count !== undefined) {
+        if (!Number.isInteger(baseDoc.count) || baseDoc.count < 0) {
+          errors.push(`${relFile}: invalid base top-level count ${JSON.stringify(baseDoc.count)}.`);
+        } else {
+          baseCount = baseDoc.count;
+        }
+      }
+      if (headDoc.count > baseCount) {
+        errors.push(`${relFile}: top-level count grew from ${baseCount} to ${headDoc.count}`);
+      }
+    }
   }
 
   for (const key of BASELINE_JSON_KEYS) {
     const headArr = Array.isArray(headDoc?.[key]) ? headDoc[key] : null;
     if (!headArr) continue;
     const baseArr = Array.isArray(baseDoc?.[key]) ? baseDoc[key] : [];
-    const { map: bMap, total: bTotal } = buildJsonCountMap(baseArr);
-    const { map: hMap, total: hTotal } = buildJsonCountMap(headArr);
+    try {
+      const { map: bMap, total: bTotal } = buildJsonCountMap(baseArr);
+      const { map: hMap, total: hTotal } = buildJsonCountMap(headArr);
 
-    if (hTotal > bTotal) {
-      errors.push(`${relFile} (${key}): baseline total grew from ${bTotal} to ${hTotal}`);
-    }
-    for (const [k, hCnt] of hMap.entries()) {
-      const bCnt = bMap.get(k) || 0;
-      if (hCnt > bCnt) {
-        errors.push(`${relFile} (${key}): baseline entry grew or was swapped in (${k}: ${bCnt} -> ${hCnt})`);
+      if (hTotal > bTotal) {
+        errors.push(`${relFile} (${key}): baseline total grew from ${bTotal} to ${hTotal}`);
       }
+      for (const [k, hCnt] of hMap.entries()) {
+        const bCnt = bMap.get(k) || 0;
+        if (hCnt > bCnt) {
+          errors.push(`${relFile} (${key}): baseline entry grew or was swapped in (${k}: ${bCnt} -> ${hCnt})`);
+        }
+      }
+    } catch (err) {
+      errors.push(`${relFile} (${key}): ${err.message}`);
     }
   }
 
@@ -235,7 +268,22 @@ export function compareIgnoreFiles(baseRaw, headRaw, relFile) {
 function resolveBaseHead(repoRoot, baseArg, headArg) {
   const baseSha = baseArg || process.env.GITHUB_BASE_SHA || '';
   const headSha = headArg || process.env.GITHUB_HEAD_SHA || '';
-  if (baseSha && headSha) return { base: baseSha, head: headSha };
+  if ((baseSha && !headSha) || (!baseSha && headSha)) {
+    throw new Error('Both --base and --head (or GITHUB_BASE_SHA and GITHUB_HEAD_SHA) must be provided together.');
+  }
+  if (baseSha && headSha) {
+    for (const [label, rev] of [['base', baseSha], ['head', headSha]]) {
+      if (String(rev).startsWith('-')) {
+        throw new Error(`Invalid ${label} revision '${rev}'.`);
+      }
+      try {
+        execFileSync('git', ['rev-parse', '--verify', `${rev}^{object}`], { cwd: repoRoot, stdio: 'ignore' });
+      } catch {
+        throw new Error(`Invalid ${label} revision '${rev}': git rev-parse --verify failed.`);
+      }
+    }
+    return { base: baseSha, head: headSha };
+  }
 
   const baseRef = process.env.GITHUB_BASE_REF || 'main';
   for (const candidate of [`origin/${baseRef}`, baseRef]) {
@@ -294,7 +342,13 @@ function main() {
   const headArg = parseFlag(args, '--head');
   const pathsArg = parseFlag(args, '--paths');
 
-  const revs = resolveBaseHead(repoRoot, baseArg, headArg);
+  let revs;
+  try {
+    revs = resolveBaseHead(repoRoot, baseArg, headArg);
+  } catch (err) {
+    console.error(`[FAIL] ${err.message}`);
+    process.exit(1);
+  }
   if (!revs) {
     console.log('[INFO] No base revision available for baseline ratchet; skipping.');
     process.exit(0);

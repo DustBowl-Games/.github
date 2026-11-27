@@ -10,7 +10,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -132,6 +132,80 @@ function stripHtmlAttributes(line) {
     .replace(/\b(?:class|href|src|d|viewBox)=@\w+/gi, ' ');
 }
 
+function extractCSharpLineLiterals(rawLine, rawState) {
+  const literals = [];
+  if (rawState.inRaw) {
+    const closeRe = new RegExp(`"{${rawState.quoteLen},}`);
+    const m = rawLine.match(closeRe);
+    if (!m) {
+      const t = rawLine.trim();
+      if (t) literals.push(t);
+      return literals;
+    }
+    const beforeClose = rawLine.slice(0, m.index).trim();
+    if (beforeClose) literals.push(beforeClose);
+    rawState.inRaw = false;
+    rawState.quoteLen = 0;
+    const rest = rawLine.slice(m.index + m[0].length);
+    if (rest) {
+      literals.push(...extractCSharpLineLiterals(rest, rawState));
+    }
+    return literals;
+  }
+
+  let i = 0;
+  const n = rawLine.length;
+  while (i < n) {
+    const ch = rawLine[i];
+    if (ch === '/' && rawLine[i + 1] === '/') {
+      break;
+    }
+    if (ch === '"') {
+      let qCount = 0;
+      while (i + qCount < n && rawLine[i + qCount] === '"') {
+        qCount++;
+      }
+      if (qCount >= 3) {
+        const afterOpen = rawLine.slice(i + qCount);
+        const closeRe = new RegExp(`"{${qCount},}`);
+        const closeMatch = afterOpen.match(closeRe);
+        if (closeMatch) {
+          const inner = afterOpen.slice(0, closeMatch.index).trim();
+          if (inner) literals.push(inner);
+          i = i + qCount + closeMatch.index + closeMatch[0].length;
+          continue;
+        }
+        const tail = afterOpen.trim();
+        if (tail) literals.push(tail);
+        rawState.inRaw = true;
+        rawState.quoteLen = qCount;
+        break;
+      }
+      if (qCount === 2) {
+        i += 2;
+        continue;
+      }
+      let j = i + 1;
+      while (j < n) {
+        if (rawLine[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (rawLine[j] === '"') {
+          literals.push(rawLine.slice(i + 1, j));
+          j++;
+          break;
+        }
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return literals;
+}
+
 function extractAuditableSegments(content, relPath) {
   const isRazor = relPath.endsWith('.razor');
   const isCsharp = relPath.endsWith('.cs');
@@ -144,6 +218,7 @@ function extractAuditableSegments(content, relPath) {
   const segments = [];
   let inCodeBlock = false;
   let codeBraceDepth = 0;
+  const rawState = { inRaw: false, quoteLen: 0 };
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -151,7 +226,7 @@ function extractAuditableSegments(content, relPath) {
     const lineNum = i + 1;
 
     if (!trimmed) continue;
-    if (trimmed.startsWith('//')) continue;
+    if (!rawState.inRaw && trimmed.startsWith('//')) continue;
 
     if (isRazor) {
       if (!inCodeBlock && /@code\s*\{/.test(trimmed)) {
@@ -166,16 +241,17 @@ function extractAuditableSegments(content, relPath) {
       }
 
       if (inCodeBlock) {
-        for (const ch of rawLine) {
-          if (ch === '{') codeBraceDepth++;
-          else if (ch === '}') codeBraceDepth--;
+        if (!rawState.inRaw) {
+          for (const ch of rawLine) {
+            if (ch === '{') codeBraceDepth++;
+            else if (ch === '}') codeBraceDepth--;
+          }
         }
-        // Only audit string literals inside @code blocks
-        const literals = [...rawLine.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1]);
+        const literals = extractCSharpLineLiterals(rawLine, rawState);
         if (literals.length > 0) {
           segments.push({ line: lineNum, text: literals.join(' '), rawLine: trimmed });
         }
-        if (codeBraceDepth <= 0) inCodeBlock = false;
+        if (!rawState.inRaw && codeBraceDepth <= 0) inCodeBlock = false;
         continue;
       }
 
@@ -187,8 +263,7 @@ function extractAuditableSegments(content, relPath) {
     }
 
     if (isCsharp) {
-      // Only audit string literals or interpolated text in .cs files
-      const literals = [...rawLine.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(m => m[1]);
+      const literals = extractCSharpLineLiterals(rawLine, rawState);
       if (literals.length > 0) {
         segments.push({ line: lineNum, text: literals.join(' '), rawLine: trimmed });
       }
@@ -265,8 +340,8 @@ export function validateAllowlist(allowlist) {
           errors.push(`legacyAuditBaseline[${idx}] is missing required non-empty string field "${field}".`);
         }
       }
-      if (entry.count !== undefined && (!Number.isInteger(entry.count) || entry.count < 1)) {
-        errors.push(`legacyAuditBaseline[${idx}].count must be an integer >= 1.`);
+      if (entry.count !== undefined && (!Number.isInteger(entry.count) || entry.count < 0)) {
+        errors.push(`legacyAuditBaseline[${idx}].count must be a non-negative integer.`);
       }
     });
   }
@@ -280,8 +355,16 @@ export function evaluateFindings(findings, allowlist, { strict = false } = {}) {
 
   const legacyRemaining = new Map();
   for (const entry of allowlist.legacyAuditBaseline || []) {
+    let count;
+    if (entry.count === undefined) {
+      count = 1;
+    } else if (Number.isInteger(entry.count) && entry.count >= 0) {
+      count = entry.count;
+    } else {
+      throw new Error(`Invalid legacyAuditBaseline entry count: ${JSON.stringify(entry.count)} (must be a non-negative integer)`);
+    }
     const key = `${normalizePath(entry.file)}|${entry.ruleId}|${normalizeFingerprint(entry.fingerprint)}`;
-    legacyRemaining.set(key, (legacyRemaining.get(key) || 0) + (entry.count || 1));
+    legacyRemaining.set(key, (legacyRemaining.get(key) || 0) + count);
   }
 
   for (const f of findings) {
@@ -340,27 +423,50 @@ export function collectTargetFiles(repoRoot = REPO_ROOT) {
     .sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
-function getDiffAddedLines(repoRoot = REPO_ROOT) {
-  const baseSha = process.env.GITHUB_BASE_SHA;
-  const headSha = process.env.GITHUB_HEAD_SHA;
+function getDiffAddedLines(repoRoot = REPO_ROOT, baseArg = '', headArg = '') {
+  const baseSha = baseArg || process.env.GITHUB_BASE_SHA || '';
+  const headSha = headArg || process.env.GITHUB_HEAD_SHA || '';
   const baseRef = process.env.GITHUB_BASE_REF || 'staging';
 
+  if ((baseSha && !headSha) || (!baseSha && headSha)) {
+    throw new Error('Both GITHUB_BASE_SHA and GITHUB_HEAD_SHA (or --base and --head) must be set together.');
+  }
+
   let diffRange = null;
+  let explicitShas = false;
   if (baseSha && headSha) {
+    explicitShas = true;
     diffRange = `${baseSha}...${headSha}`;
   } else {
     try {
-      execSync(`git rev-parse --verify origin/${baseRef}`, { cwd: repoRoot, stdio: 'ignore' });
+      execFileSync('git', ['rev-parse', '--verify', `origin/${baseRef}`], { cwd: repoRoot, stdio: 'ignore' });
       diffRange = `origin/${baseRef}...HEAD`;
     } catch {
-      diffRange = 'HEAD~1..HEAD';
+      try {
+        execFileSync('git', ['rev-parse', '--verify', 'HEAD~1'], { cwd: repoRoot, stdio: 'ignore' });
+        diffRange = 'HEAD~1..HEAD';
+      } catch {
+        try {
+          execFileSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: repoRoot, stdio: 'ignore' });
+          diffRange = '4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD';
+        } catch {
+          return [];
+        }
+      }
     }
   }
 
   let diffOut = '';
   try {
-    diffOut = execSync(`git diff -U0 ${diffRange}`, { cwd: repoRoot, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
-  } catch {
+    diffOut = execFileSync('git', ['diff', '-U0', diffRange], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+    });
+  } catch (err) {
+    if (explicitShas) {
+      throw new Error(`git diff failed for explicit revisions '${diffRange}': ${err.message}`);
+    }
     return [];
   }
 
@@ -481,18 +587,32 @@ function main() {
     process.exit(0);
   }
 
+  const parseFlag = name => {
+    const idx = args.indexOf(name);
+    if (idx !== -1 && args[idx + 1] && !args[idx + 1].startsWith('--')) return args[idx + 1];
+    const eq = args.find(a => a.startsWith(`${name}=`));
+    return eq ? eq.slice(name.length + 1) : '';
+  };
+  const baseArg = parseFlag('--base');
+  const headArg = parseFlag('--head');
+
   let result;
-  if (scanAll) {
-    const files = collectTargetFiles(repoRoot);
-    console.log(`Auditing ${files.length} public-facing file(s) in ${repoRoot} for unverified factual claims (strict=${strict})...`);
-    result = auditFiles(files, allowlist, { strict });
-  } else {
-    console.log(`Auditing diff additions in ${repoRoot} for unverified factual claims (strict=${strict})...`);
-    const diffFindings = getDiffAddedLines(repoRoot);
-    result = {
-      allFindings: diffFindings,
-      ...evaluateFindings(diffFindings, allowlist, { strict }),
-    };
+  try {
+    if (scanAll) {
+      const files = collectTargetFiles(repoRoot);
+      console.log(`Auditing ${files.length} public-facing file(s) in ${repoRoot} for unverified factual claims (strict=${strict})...`);
+      result = auditFiles(files, allowlist, { strict });
+    } else {
+      console.log(`Auditing diff additions in ${repoRoot} for unverified factual claims (strict=${strict})...`);
+      const diffFindings = getDiffAddedLines(repoRoot, baseArg, headArg);
+      result = {
+        allFindings: diffFindings,
+        ...evaluateFindings(diffFindings, allowlist, { strict }),
+      };
+    }
+  } catch (err) {
+    console.error(`[FAIL] ${err.message}`);
+    process.exit(1);
   }
 
   console.log(

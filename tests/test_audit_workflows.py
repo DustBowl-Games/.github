@@ -38,6 +38,13 @@ def make_clean_pr_workflow():
             "shared": {
                 "uses": "DustBowl-Games/.github/.github/workflows/_security-gate.yml@main",
                 "permissions": {"contents": "read"},
+                "with": {
+                    "runner_labels": (
+                        "${{ (github.event_name == 'pull_request' && "
+                        "github.event.pull_request.head.repo.full_name != github.repository) "
+                        "&& '[\"ubuntu-latest\"]' || '[\"self-hosted\",\"Linux\",\"X64\"]' }}"
+                    )
+                },
             },
             "push_only": {
                 "if": "github.event_name == 'push'",
@@ -195,6 +202,252 @@ class AuditWorkflowsTests(unittest.TestCase):
         }
         findings = audit_workflows.audit_workflow_doc(bad, ".github/workflows/pr-target.yml")
         self.assertEqual([f["ruleId"] for f in findings], ["WF_NO_PULL_REQUEST_TARGET_HEAD_CHECKOUT"])
+
+    def test_baseline_count_zero_grants_zero_waivers_and_rejects_invalid_count(self):
+        finding = {
+            "file": ".github/workflows/ci.yml",
+            "job": "j",
+            "ruleId": "WF_SHA_PINNED_USES",
+            "fingerprint": "actions/checkout@v4",
+            "message": "unpinned",
+        }
+        baselined, unapproved = audit_workflows.apply_baseline([finding], [{**finding, "count": 0}])
+        self.assertEqual(baselined, [])
+        self.assertEqual(len(unapproved), 1)
+
+        for bad_count in ("999", -1, 1.5, True):
+            with self.subTest(bad_count=bad_count):
+                with self.assertRaises(ValueError):
+                    audit_workflows.apply_baseline([finding], [{**finding, "count": bad_count}])
+
+    def test_blocks_fork_pr_isolation_bypasses_and_case_insensitive_self_hosted(self):
+        base_step = [{"uses": PINNED_CHECKOUT, "with": {"persist-credentials": False}}]
+        unsafe_docs = [
+            (
+                "or_pull_request_if",
+                {
+                    True: {"pull_request": {}, "push": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "if": "github.event_name == 'push' || github.event_name == 'pull_request'",
+                            "runs-on": ["self-hosted", "Linux"],
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "always_or_push",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "if": "always() || github.event_name == 'push'",
+                            "runs-on": ["self-hosted", "Linux"],
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "inverted_ternary",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ (github.event.pull_request.head.repo.full_name != github.repository) && 'self-hosted' || 'ubuntu-latest' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "and_false",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ (github.event.pull_request.head.repo.fork && false) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "negated_fork",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ !(github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "negated_full_name",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ !(github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "reusable_missing_runner_labels",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "uses": "DustBowl-Games/.github/.github/workflows/_security-gate.yml@main",
+                        }
+                    },
+                },
+            ),
+            (
+                "case_insensitive_self_hosted",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": ["Self-Hosted", "Linux"],
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "fork_pred_after_or",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ (github.actor == 'x' && 'ubuntu-latest') || (github.event.pull_request.head.repo.fork && 'self-hosted') }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "event_name_neq_pr_in_before_or",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ (github.event_name != 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+            (
+                "same_repo_eq_in_before_or",
+                {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "${{ (github.event.pull_request.head.repo.fork && github.event.pull_request.head.repo.full_name == github.repository) && 'ubuntu-latest' || 'self-hosted' }}",
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                },
+            ),
+        ]
+        for label, doc in unsafe_docs:
+            with self.subTest(case=label):
+                findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/bad.yml")
+                self.assertIn("WF_FORK_PR_RUNNER_ISOLATION", [f["ruleId"] for f in findings], findings)
+
+        non_pr_reusable = {
+            True: {"pull_request": {}, "push": {}},
+            "permissions": {"contents": "read"},
+            "jobs": {
+                "release": {
+                    "if": "github.event_name == 'push'",
+                    "uses": "DustBowl-Games/.github/.github/workflows/_release-notes.yml@main",
+                }
+            },
+        }
+        self.assertEqual(audit_workflows.audit_workflow_doc(non_pr_reusable, ".github/workflows/rel.yml"), [])
+
+        safe_full_name_routing = {
+            True: {"pull_request": {}},
+            "permissions": {"contents": "read"},
+            "jobs": {
+                "j": {
+                    "runs-on": "${{ !(github.event.pull_request.draft) && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'self-hosted' }}",
+                    "timeout-minutes": 5,
+                    "steps": base_step,
+                }
+            },
+        }
+        self.assertEqual(audit_workflows.audit_workflow_doc(safe_full_name_routing, ".github/workflows/ok.yml"), [])
+
+    def test_blocks_uppercase_format_and_bracket_script_injection(self):
+        for expr in (
+            "${{ GITHUB.EVENT.PULL_REQUEST.TITLE }}",
+            "${{ format('{0}', github.event.pull_request.title) }}",
+            "${{ format('can''t {0}', github.event.pull_request.title) }}",
+            "${{ format('can''t } {0}', github.event.pull_request.title) }}",
+            "${{ github['event']['pull_request']['title'] }}",
+        ):
+            with self.subTest(expr=expr):
+                doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "ubuntu-latest",
+                            "timeout-minutes": 5,
+                            "steps": [{"run": f'echo "{expr}"'}],
+                        }
+                    },
+                }
+                findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/inj.yml")
+                self.assertEqual([f["ruleId"] for f in findings], ["WF_NO_SCRIPT_INJECTION"])
+
+        for safe_expr in (
+            "${{ format('{0}', github.repository) }}",
+            "${{ format('can''t {0}', github.repository) }}",
+        ):
+            with self.subTest(safe_expr=safe_expr):
+                safe_doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "ubuntu-latest",
+                            "timeout-minutes": 5,
+                            "steps": [{"run": f'echo "{safe_expr}"'}],
+                        }
+                    },
+                }
+                self.assertEqual(audit_workflows.audit_workflow_doc(safe_doc, ".github/workflows/safe.yml"), [])
 
 
 if __name__ == "__main__":

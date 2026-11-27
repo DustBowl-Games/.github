@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -211,5 +211,101 @@ test('CLI scans caller workspace via --repo-root and GITHUB_WORKSPACE even when 
     assert.match(posRes.stdout, /Auditing 1 public-facing file\(s\)/);
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test('legacyAuditBaseline respects count: 0 and rejects non-integer/negative counts', () => {
+  const findings = auditText('<p>Same Business Day</p>', 'Components/Shared/Host.razor');
+  const allowZero = {
+    schemaVersion: 1,
+    verifiedFacts: [],
+    legacyAuditBaseline: [
+      {
+        file: 'Components/Shared/Host.razor',
+        ruleId: 'UNAPPROVED_RESPONSE_SLA',
+        fingerprint: '<p>Same Business Day</p>',
+        status: 'needs-owner-review',
+        count: 0,
+      },
+    ],
+  };
+  assert.deepEqual(validateAllowlist(allowZero), []);
+  const resZero = evaluateFindings(findings, allowZero, { strict: false });
+  assert.equal(resZero.legacyMatches.length, 0);
+  assert.equal(resZero.unapproved.length, 1);
+
+  for (const badCount of ['999', -1, 1.5]) {
+    assert.throws(() =>
+      evaluateFindings(findings, {
+        schemaVersion: 1,
+        verifiedFacts: [],
+        legacyAuditBaseline: [{ ...allowZero.legacyAuditBaseline[0], count: badCount }],
+      })
+    );
+    assert.ok(
+      validateAllowlist({
+        schemaVersion: 1,
+        verifiedFacts: [],
+        legacyAuditBaseline: [{ ...allowZero.legacyAuditBaseline[0], count: badCount }],
+      }).length > 0
+    );
+  }
+});
+
+test('audits multi-line and single-line C# raw string literals while ignoring clean copy and comments', () => {
+  const csBad = [
+    'public static class SeedArticles {',
+    '  // 24/7 support in comment outside literal is ignored',
+    '  public const string Body = """',
+    '      We guarantee 24/7 support and 99.9% uptime guarantee.',
+    '      """;',
+    '  public const string FourQuotes = $""""',
+    '      Same Business Day dispatch for "{tier}".',
+    '      """";',
+    '  public const string Inline = """SOC 2 certified""";',
+    '}',
+  ].join('\n');
+
+  const findings = auditText(csBad, 'Services/SeedArticles.cs');
+  const rules = new Set(findings.map(f => f.ruleId));
+  assert.ok(rules.has('UNAPPROVED_24_7_CLAIM'));
+  assert.ok(rules.has('UNAPPROVED_SLA_PERCENT'));
+  assert.ok(rules.has('UNAPPROVED_RESPONSE_SLA'));
+  assert.ok(rules.has('UNAPPROVED_CERTIFICATION_CLAIM'));
+  assert.equal(findings.some(f => f.line === 2), false);
+
+  const csClean = [
+    'public static class CleanArticles {',
+    '  public const string Body = """',
+    '      Owned bare-metal game server hosting in Hickory, NC.',
+    '      """;',
+    '}',
+  ].join('\n');
+  assert.equal(auditText(csClean, 'Services/SeedArticles.cs').length, 0);
+});
+
+test('CLI diff mode fails closed when GITHUB_BASE_SHA / GITHUB_HEAD_SHA fail git diff', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-badsha-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+    fs.mkdirSync(path.join(tmpRepo, 'config'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'config', 'verified-claims-allowlist.json'),
+      JSON.stringify({ schemaVersion: 1, verifiedFacts: [], legacyAuditBaseline: [] })
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: init']);
+
+    const res = spawnSync(process.execPath, [SCRIPT_PATH, '--repo-root', tmpRepo], {
+      encoding: 'utf8',
+      env: { ...process.env, GITHUB_BASE_SHA: 'deadbeef'.repeat(5), GITHUB_HEAD_SHA: 'cafebabe'.repeat(5) },
+    });
+    assert.equal(res.status, 1);
+    assert.match(res.stderr, /\[FAIL\]/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });

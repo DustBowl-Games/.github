@@ -333,3 +333,44 @@ test('CLI rejects baseline deletion when Allow-Baseline-Removal lacks a same-lin
     fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });
+
+test('compareJsonBaselines rejects string/negative counts, blocks 0->1, and enforces top-level count ratchet', () => {
+  const baseObj = JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'R1', count: 1 }] });
+  for (const badCount of ['999', -1, 1.5, null]) {
+    const headBad = JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'R1', count: badCount }] });
+    assert.equal(compareJsonBaselines(baseObj, headBad, 'config/smells.json').length > 0, true);
+  }
+
+  const baseZero = JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'R1', count: 0 }] });
+  const headZero = JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'R1', count: 0 }] });
+  const headOne = JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'R1', count: 1 }] });
+  assert.deepEqual(compareJsonBaselines(baseZero, headZero, 'config/smells.json'), []);
+  assert.equal(compareJsonBaselines(baseZero, headOne, 'config/smells.json').length > 0, true);
+
+  assert.deepEqual(compareJsonBaselines('{"count": 639}', '{"count": 500}', 'config/legacy.json'), []);
+  assert.equal(compareJsonBaselines('{"count": 639}', '{"count": 999}', 'config/legacy.json').length > 0, true);
+  assert.equal(compareJsonBaselines('{"count": 639}', '{"count": "999"}', 'config/legacy.json').length > 0, true);
+});
+
+test('CLI fails closed on invalid explicit --base/--head SHAs even with zero baseline files', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-badsha-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+    fs.writeFileSync(path.join(tmpRepo, 'README.md'), 'hello\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'init']);
+
+    const badRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', 'deadbeef'.repeat(5), '--head', 'cafebabe'.repeat(5)],
+      { encoding: 'utf8' }
+    );
+    assert.equal(badRes.status, 1);
+    assert.match(badRes.stderr, /Invalid base revision/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
