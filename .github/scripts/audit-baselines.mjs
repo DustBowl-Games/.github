@@ -42,8 +42,8 @@ const BASELINE_JSON_KEYS = [
   'baseline',
 ];
 
-const ALLOW_BASELINE_INIT_RE = /Allow-Baseline-Init:\s*(?:#\d+|https?:\/\/\S+)/i;
-const ALLOW_BASELINE_REMOVAL_RE = /Allow-Baseline-Removal:\s*\S+/i;
+const ALLOW_BASELINE_INIT_RE = /Allow-Baseline-Init:[ \t]*(?:#\d+|https?:\/\/\S+)/i;
+const ALLOW_BASELINE_REMOVAL_RE = /Allow-Baseline-Removal:[ \t]*\S+/i;
 
 export function normalizePath(p) {
   return p.replace(/\\/g, '/').replace(/^\.\//, '');

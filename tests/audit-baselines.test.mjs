@@ -75,6 +75,7 @@ test('hasBaselineInitApproval requires issue number or URL', () => {
   assert.equal(hasBaselineInitApproval('chore: init\n\nAllow-Baseline-Init: #2451', ''), true);
   assert.equal(hasBaselineInitApproval('', 'Allow-Baseline-Init: https://github.com/org/repo/issues/12'), true);
   assert.equal(hasBaselineInitApproval('chore: init\n\nAllow-Baseline-Init: trust-me', ''), false);
+  assert.equal(hasBaselineInitApproval('', 'Allow-Baseline-Init:\n\n#123'), false);
   assert.equal(hasBaselineInitApproval('chore: init', ''), false);
 });
 
@@ -85,6 +86,11 @@ test('hasBaselineRemovalApproval requires a non-empty reason', () => {
   );
   assert.equal(hasBaselineRemovalApproval('', 'Allow-Baseline-Removal: resolved'), true);
   assert.equal(hasBaselineRemovalApproval('chore: cleanup\n\nAllow-Baseline-Removal:   ', ''), false);
+  assert.equal(hasBaselineRemovalApproval('', 'Allow-Baseline-Removal:\n\n## Summary\nRoutine refactor'), false);
+  assert.equal(
+    hasBaselineRemovalApproval('chore: drop\n\nAllow-Baseline-Removal:\nSigned-off-by: Bot', ''),
+    false
+  );
   assert.equal(hasBaselineRemovalApproval('chore: cleanup', ''), false);
 });
 
@@ -279,5 +285,51 @@ test('CLI blocks silent deletion of tracked baseline files and allows approved o
     assert.doesNotMatch(passCommitRes.stderr, /ENOENT/);
   } finally {
     fs.rmSync(soleRepo, { recursive: true, force: true });
+  }
+});
+
+test('CLI rejects baseline deletion when Allow-Baseline-Removal lacks a same-line reason', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'baseline-newline-bypass-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(tmpRepo, 'config'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'config', 'ai-smells-baseline.json'),
+      JSON.stringify({ ai_smells_baseline: [{ file: 'a.cs', ruleId: 'EMPTY_CATCH', fingerprint: 'x', count: 1 }] })
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: initial baseline']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    git(['rm', 'config/ai-smells-baseline.json']);
+    git(['commit', '-m', 'chore: drop\n\nAllow-Baseline-Removal:\nSigned-off-by: Bot']);
+    const commitBypassSha = git(['rev-parse', 'HEAD']).trim();
+
+    // Case 1: Empty Allow-Baseline-Removal in multiline commit message must exit 1 with [BASELINE_RATCHET]
+    const commitFailRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', commitBypassSha],
+      { encoding: 'utf8' }
+    );
+    assert.equal(commitFailRes.status, 1);
+    assert.match(commitFailRes.stderr, /\[BASELINE_RATCHET\]/);
+
+    // Case 2: Empty Allow-Baseline-Removal in multiline PR_BODY must exit 1 with [BASELINE_RATCHET]
+    git(['commit', '--amend', '-m', 'chore: drop baseline']);
+    const prBypassSha = git(['rev-parse', 'HEAD']).trim();
+
+    const prFailRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', prBypassSha],
+      { encoding: 'utf8', env: { ...process.env, PR_BODY: 'Allow-Baseline-Removal:\n\n## Summary\nRoutine refactor' } }
+    );
+    assert.equal(prFailRes.status, 1);
+    assert.match(prFailRes.stderr, /\[BASELINE_RATCHET\]/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });
