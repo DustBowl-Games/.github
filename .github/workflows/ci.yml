@@ -16,7 +16,7 @@ permissions:
 jobs:
   validate-workflows:
     name: "Test: Reusable Workflow Contracts & Factual Claims"
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","dustbowl-linux"]') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
