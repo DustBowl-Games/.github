@@ -23,6 +23,7 @@ runner_labels: ${{ (github.event_name == 'pull_request' && github.event.pull_req
 Runs OSS Gitleaks (`ghcr.io/gitleaks/gitleaks` container), OSS Trivy filesystem/IaC & optional container image scan, OSS Semgrep SAST (`--metrics=off`, combining `semgrep_config`, org `.semgrep/antislop-rules.yml`, and caller `.semgrep/antislop-rules.yml` without duplicate-rule collisions), Dockerfile multi-stage/non-root/digest safety checks (`audit-infra-safety.py`), and optional Kubernetes/Helm safety checks.
 
 ### Inputs
+
 | Input | Type | Default | Purpose |
 |---|---|---|---|
 | `runner_labels` | string | `["self-hosted","Linux","X64","dustbowl-linux"]` | Runner labels JSON array |
@@ -57,6 +58,7 @@ jobs:
 Runs Conventional Commits + AI buzzword/watermark linting (`verify-commit-msg.py`), CI integrity & anti-bypass guard (`audit-ci-integrity.mjs`), workflow hygiene (`audit-workflows.py` + SHA256-verified `actionlint` v1.7.12 and `shellcheck` v0.11.0), anti-AI-slop & cleanliness gate (`audit-ai-smells.py`), optional baseline ratchet (`audit-baselines.mjs`), Lizard cyclomatic complexity guard, `jscpd` duplicate code scan, NPM lockfile + Knip dead-code guard, PostgreSQL migration `CONCURRENTLY` index guard, and optional `helm lint`.
 
 ### Inputs
+
 | Input | Type | Default | Purpose |
 |---|---|---|---|
 | `runner_labels` | string | `["self-hosted","Linux","X64","dustbowl-linux"]` | Runner labels JSON array |
@@ -101,6 +103,15 @@ jobs:
 
 Scans `$GITHUB_WORKSPACE` (via `--repo-root "$GITHUB_WORKSPACE"`) to block unapproved SLA percentages, response-time guarantees (`same business day`, `within 24 hours`, `< 2 hour`, `priority ticket dispatch`), `24/7` claims, hardcoded fiber/ms latency numbers, refund/uptime guarantees, and unverified compliance badges (`SOC 2`, `NIST 800-88`, `Fortune 500`) unless explicitly allowlisted in `config/verified-claims-allowlist.json`.
 
+### Inputs
+
+| Input | Type | Default | Purpose |
+|---|---|---|---|
+| `runner_labels` | string | `["self-hosted","Linux","X64","dustbowl-linux"]` | Runner labels JSON array (route fork PRs to `ubuntu-latest`) |
+| `allowlist_path` | string | `config/verified-claims-allowlist.json` | Path to `verified-claims-allowlist.json` in the caller repository |
+| `strict` | boolean | `false` | Fail even on `legacyAuditBaseline` entries |
+| `scan_all` | boolean | `true` | Scan all public-facing files instead of diff-only |
+
 ```yaml
 jobs:
   factual-claims:
@@ -118,14 +129,24 @@ jobs:
 
 Builds, enforces `NuGetAudit` (`low`/`moderate`/`high`/`critical`), optionally checks `dotnet format --verify-no-changes` and compiler warning strictness, runs tests, scans OCI images with OSS Trivy, generates CycloneDX SBOMs, and pushes to GHCR on `push`.
 
-### Additional Inputs
+### Inputs
+
 | Input | Type | Default | Purpose |
 |---|---|---|---|
+| `runner_labels` | string | `["self-hosted","Linux","X64","dustbowl-linux"]` | Runner labels JSON array (route fork PRs to `ubuntu-latest`) |
+| `project_path` | string | *(required)* | Path to `.csproj` or `.sln` |
+| `dotnet_version` | string | `10.0.x` | .NET SDK version |
+| `sdk_image` | string | `mcr.microsoft.com/dotnet/sdk:10.0` | Container SDK image |
+| `helm_chart_path` | string | `""` | Optional Helm chart directory to lint |
+| `image_name` | string | `""` | GHCR image name (e.g. `ghcr.io/dustbowl-games/my-service`) |
+| `publish_image` | boolean | `false` | Push immutable and branch tags to GHCR |
+| `run_tests` | boolean | `true` | Run `dotnet test` |
+| `fail_on_vulnerable_nuget` | boolean | `true` | Fail build if NuGet vulnerabilities at or above `nuget_audit_level` are detected |
 | `run_format_check` | boolean | `false` | Run `dotnet format --verify-no-changes --no-restore` |
-| `nuget_audit_level` | string | `high` | `low`, `moderate`, `high`, or `critical` |
-| `treat_warnings_as_errors` | boolean | `false` | Pass `-p:TreatWarningsAsErrors=true` |
-| `warning_level` | string | `""` | Optional MSBuild `-p:WarningLevel=<n>` |
-| `enforce_code_style` | boolean | `false` | Pass `-p:EnforceCodeStyleInBuild=true` |
+| `nuget_audit_level` | string | `high` | Minimum NuGetAudit vulnerability severity (`low`, `moderate`, `high`, or `critical`) |
+| `treat_warnings_as_errors` | boolean | `false` | Pass `-p:TreatWarningsAsErrors=true` to `dotnet build` |
+| `warning_level` | string | `""` | Optional MSBuild `WarningLevel` property (e.g. `9999`) |
+| `enforce_code_style` | boolean | `false` | Pass `-p:EnforceCodeStyleInBuild=true` to `dotnet build` |
 
 ```yaml
 jobs:
@@ -149,6 +170,15 @@ jobs:
 
 ## 5. Automated Release Notes (`_release-notes.yml`)
 
+Creates a GitHub Release with generated notes on tag pushes.
+
+### Inputs
+
+| Input | Type | Default | Purpose |
+|---|---|---|---|
+| `runner_labels` | string | `["self-hosted","Linux","X64","dustbowl-linux"]` | Runner labels JSON array |
+| `tag_name` | string | `""` | Tag name to release (defaults to `github.ref_name`) |
+
 ```yaml
 on:
   push:
@@ -165,7 +195,7 @@ jobs:
 
 ## 6. Baseline Ratchet & Recommended Repository Rulesets
 
-- **Baseline Ratchets:** Whenever a repository initializes a new baseline or ignore file (`.trivyignore`, `.gitleaksignore`, `.semgrepignore`, `config/*baseline*.json`, `config/*allowlist*.json`), `audit-baselines.mjs` requires `Allow-Baseline-Init: #<issue>` (or full issue URL) in commit messages or the PR body, and ensures subsequent PRs can only keep or shrink entry counts.
+- **Baseline Ratchets:** Whenever a repository initializes a new baseline or ignore file (`.trivyignore`, `.gitleaksignore`, `.semgrepignore`, `config/*baseline*.json`, `config/*allowlist*.json`, `.github/*baseline*.json`), `audit-baselines.mjs` requires `Allow-Baseline-Init: #<issue>` (or full issue URL) in commit messages or the PR body, ensures subsequent PRs can only keep or shrink entry counts, and requires `Allow-Baseline-Removal: <reason>` in commit messages or the PR body when removing a tracked baseline or ignore file.
 - **Test Removal Approval:** Deleting `*Tests.cs`, `*.test.mjs`, or `test_*.py` files requires `Allow-Test-Removal: <reason>` in commit messages or the PR body.
 - **Recommended Branch / Ruleset Settings (for repository admins):**
   - Require pull request before merging (`required_linear_history: true`, squash or rebase merge, automatic branch deletion on merge).
