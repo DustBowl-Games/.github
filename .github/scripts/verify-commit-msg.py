@@ -58,16 +58,14 @@ def validate_commit_message(message: str, sha: str = "") -> list[str]:
         return [f"{prefix}empty commit message"]
 
     subj = lines[0]
-    if subj.startswith(BYPASS_PREFIXES):
-        return []
-
     errors: list[str] = []
-    if not CC_RE.match(subj):
-        errors.append(f"{prefix}invalid Conventional Commit subject: {subj}")
-    if len(subj) > 72:
-        errors.append(f"{prefix}subject exceeds 72 chars ({len(subj)}): {subj}")
-    if subj.endswith("."):
-        errors.append(f"{prefix}subject must not end with a period: {subj}")
+    if not subj.startswith(BYPASS_PREFIXES):
+        if not CC_RE.match(subj):
+            errors.append(f"{prefix}invalid Conventional Commit subject: {subj}")
+        if len(subj) > 72:
+            errors.append(f"{prefix}subject exceeds 72 chars ({len(subj)}): {subj}")
+        if subj.endswith("."):
+            errors.append(f"{prefix}subject must not end with a period: {subj}")
 
     full_body = "\n".join(lines)
     m_buzz = FORBIDDEN_BUZZWORDS.search(full_body)

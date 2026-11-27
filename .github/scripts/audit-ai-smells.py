@@ -152,13 +152,46 @@ def is_dash_target(rel_path: str, allow_markdown_dashes: bool) -> bool:
     return False
 
 
+def _split_css_declarations(style_val: str) -> list[str]:
+    decls: list[str] = []
+    buf: list[str] = []
+    in_sq = False
+    in_dq = False
+    paren_depth = 0
+    for ch in style_val:
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+            elif ch == ";" and paren_depth == 0:
+                part = "".join(buf).strip()
+                if part:
+                    decls.append(part)
+                buf = []
+                continue
+        buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        decls.append(tail)
+    return decls
+
+
 def is_allowed_inline_style(style_val: str) -> bool:
-    lower = style_val.lower()
-    if "background-image:" in lower:
-        return True
-    if "@" in style_val and "width:" in lower:
-        return True
-    return False
+    decls = _split_css_declarations(style_val)
+    if not decls:
+        return False
+    for decl in decls:
+        if re.match(r"^background-image\s*:", decl, re.IGNORECASE):
+            continue
+        if re.match(r"^width\s*:", decl, re.IGNORECASE) and "@" in decl:
+            continue
+        return False
+    return True
 
 
 def _strip_markup_comments(text: str) -> str:
@@ -414,6 +447,15 @@ def resolve_git_diff(repo_root: pathlib.Path, base_arg: str, head_arg: str) -> s
     if base_sha and head_sha:
         rev_range = f"{base_sha}...{head_sha}"
     else:
+        head_chk = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        head_resolved = head_chk.stdout.strip() if head_chk.returncode == 0 else ""
         base_ref = os.environ.get("GITHUB_BASE_REF", "main")
         for candidate in (f"origin/{base_ref}", base_ref):
             chk = subprocess.run(
@@ -424,7 +466,7 @@ def resolve_git_diff(repo_root: pathlib.Path, base_arg: str, head_arg: str) -> s
                 encoding="utf-8",
                 errors="replace",
             )
-            if chk.returncode == 0:
+            if chk.returncode == 0 and chk.stdout.strip() and chk.stdout.strip() != head_resolved:
                 rev_range = f"{candidate}...HEAD"
                 break
         if not rev_range:
@@ -438,6 +480,8 @@ def resolve_git_diff(repo_root: pathlib.Path, base_arg: str, head_arg: str) -> s
             )
             if chk_prev.returncode == 0:
                 rev_range = "HEAD~1..HEAD"
+            elif head_resolved:
+                rev_range = "4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD"
             else:
                 return ""
 
@@ -472,6 +516,14 @@ def load_baseline(baseline_path: pathlib.Path | None) -> list[dict]:
     raise ValueError(f"Unsupported baseline JSON schema in {baseline_path}")
 
 
+def _parse_baseline_count(raw_cnt: object) -> int:
+    if raw_cnt is None:
+        return 1
+    if isinstance(raw_cnt, bool) or not isinstance(raw_cnt, int) or raw_cnt < 0:
+        raise ValueError(f"Baseline entry 'count' must be a non-negative integer (got {raw_cnt!r})")
+    return raw_cnt
+
+
 def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[list[dict], list[dict]]:
     exact_counts: dict[tuple[str, str, str], int] = {}
     rule_counts: dict[tuple[str, str], int] = {}
@@ -479,7 +531,7 @@ def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[
     for entry in baseline_entries:
         rel = normalize_path(str(entry.get("file", "")))
         rule_id = str(entry.get("ruleId", ""))
-        cnt = int(entry.get("count", 1) or 1)
+        cnt = _parse_baseline_count(entry.get("count"))
         fp = entry.get("fingerprint")
         if fp:
             key = (rel, rule_id, str(fp).strip())
@@ -591,7 +643,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ai_smells_baseline": build_baseline_payload(findings)}, indent=2, ensure_ascii=True))
         return 0
 
-    baselined, unapproved = apply_baseline(findings, baseline_entries)
+    try:
+        baselined, unapproved = apply_baseline(findings, baseline_entries)
+    except ValueError as exc:
+        print(f"[FAIL] Invalid baseline: {exc}", file=sys.stderr)
+        return 1
     mode = "full" if args.all else "diff"
     print(
         f"[SUMMARY] Anti-slop & cleanliness ({mode}): "

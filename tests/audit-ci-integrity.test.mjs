@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   applyBaseline,
   auditDiffLines,
+  auditRepoFiles,
   resolveRepoRoot,
 } from '../.github/scripts/audit-ci-integrity.mjs';
 
@@ -366,4 +367,136 @@ test('catches Skip = after string literal containing ) and ignores Skip = inside
   const skipFindings = findings.filter(f => f.ruleId === 'SKIPPED_TEST');
   assert.equal(skipFindings.length, 1);
   assert.equal(skipFindings[0].line, 1);
+});
+
+test('applyBaseline respects count: 0 and rejects non-integer/negative counts', () => {
+  const findings = [
+    { file: 'src/A.cs', line: 1, ruleId: 'NEW_SUPPRESSION_DIRECTIVE', fingerprint: '// nosemgrep', message: 'm' },
+  ];
+  const zeroRes = applyBaseline(findings, [{ file: 'src/A.cs', ruleId: 'NEW_SUPPRESSION_DIRECTIVE', count: 0 }]);
+  assert.equal(zeroRes.baselined.length, 0);
+  assert.equal(zeroRes.unapproved.length, 1);
+
+  for (const badCount of ['999', -1, 1.5, null, false]) {
+    assert.throws(() => applyBaseline(findings, [{ file: 'src/A.cs', ruleId: 'NEW_SUPPRESSION_DIRECTIVE', count: badCount }]));
+  }
+});
+
+test('blocks namespaced/Attribute skip variants, expanded suppressions, expression continue-on-error, and || echo / multiline || masking', () => {
+  const diff = [
+    '+++ b/tests/NamespaceTests.cs',
+    '@@ -1,0 +1,8 @@',
+    '+[Xunit.Fact(Skip = "flaky")]',
+    '+public void S1() {}',
+    '+[FactAttribute(Skip = "flaky")]',
+    '+public void S2() {}',
+    '+[Xunit.TheoryAttribute(',
+    '+  DisplayName = "ok",',
+    '+  Skip = "broken"',
+    '+)]',
+    '+++ b/src/Service.cs',
+    '@@ -1,0 +1,3 @@',
+    '+/* nosemgrep */',
+    '+# pragma warning disable CS0168',
+    '+[System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Design", "CA1062")]',
+    '+++ b/src/app.ts',
+    '@@ -1,0 +1,2 @@',
+    '+/* @ts-ignore */',
+    '+// @ts-expect-error',
+    '+++ b/.github/workflows/ci.yml',
+    '@@ -1,0 +1,8 @@',
+    '+        continue-on-error: ${{ 1 == 1 }}',
+    '+        continue-on-error: ${{ inputs.allow_fail }}',
+    '+        continue-on-error: ${{ false }}',
+    '+        run: npm test || echo ok',
+    '+        run: |',
+    '+          npm test ||',
+    '+            true',
+    '+        run: npm test && echo ok',
+    '+++ b/scripts/run.sh',
+    '@@ -1,0 +1,3 @@',
+    '+cmd || \\',
+    '+  echo masked',
+  ].join('\n');
+
+  const findings = auditDiffLines(diff, [], '');
+  assert.equal(findings.filter(f => f.ruleId === 'SKIPPED_TEST').length, 3);
+  assert.equal(findings.filter(f => f.ruleId === 'NEW_SUPPRESSION_DIRECTIVE').length, 5);
+  assert.equal(findings.filter(f => f.ruleId === 'CONTINUE_ON_ERROR').length, 2);
+  assert.equal(findings.filter(f => f.ruleId === 'EXIT_CODE_MASKING').length, 3);
+});
+
+test('CLI catches test file rename away from test pattern while allowing test-to-test rename', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-integrity-rename-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(tmpRepo, 'tests'), { recursive: true });
+    fs.mkdirSync(path.join(tmpRepo, 'docs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'tests', 'AuthTests.cs'),
+      'public class AuthTests {\n  [Fact]\n  public void Works() {}\n}\n'
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'test: add AuthTests']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    // Positive: renaming test file to another test file passes
+    git(['mv', 'tests/AuthTests.cs', 'tests/LoginTests.cs']);
+    git(['commit', '-m', 'test: rename AuthTests to LoginTests']);
+    const renameTestSha = git(['rev-parse', 'HEAD']).trim();
+
+    const passRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', renameTestSha],
+      { encoding: 'utf8' }
+    );
+    assert.equal(passRes.status, 0, passRes.stderr);
+
+    // Negative: renaming test file to non-test path triggers UNAPPROVED_TEST_DELETION
+    git(['mv', 'tests/LoginTests.cs', 'docs/archived.txt']);
+    git(['commit', '-m', 'chore: hide test as txt']);
+    const hideSha = git(['rev-parse', 'HEAD']).trim();
+
+    const failRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', renameTestSha, '--head', hideSha],
+      { encoding: 'utf8' }
+    );
+    assert.notEqual(failRes.status, 0);
+    assert.match(failRes.stderr, /UNAPPROVED_TEST_DELETION/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
+
+test('auditRepoFiles (--all) catches TreatWarningsAsErrors=false while ignoring XML-commented false', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-integrity-all-'));
+  try {
+    const propsPath = path.join(tmpDir, 'Directory.Build.props');
+    fs.writeFileSync(
+      propsPath,
+      '<Project><PropertyGroup><!-- <TreatWarningsAsErrors>false</TreatWarningsAsErrors> --></PropertyGroup></Project>\n'
+    );
+    assert.equal(
+      auditRepoFiles(tmpDir).filter(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED').length,
+      0
+    );
+
+    fs.writeFileSync(
+      propsPath,
+      '<Project><PropertyGroup><TreatWarningsAsErrors>false</TreatWarningsAsErrors></PropertyGroup></Project>\n'
+    );
+    const findings = auditRepoFiles(tmpDir).filter(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED');
+    assert.equal(findings.length, 1);
+
+    const cliRes = spawnSync(process.execPath, [SCRIPT_PATH, '--repo-root', tmpDir, '--all'], { encoding: 'utf8' });
+    assert.equal(cliRes.status, 1);
+    assert.match(cliRes.stderr, /TREAT_WARNINGS_AS_ERRORS_WEAKENED/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

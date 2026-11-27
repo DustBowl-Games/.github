@@ -40,11 +40,15 @@ const TEST_FILE_RE = /(?:Tests?\.cs|\.test\.(?:mjs|js|ts)|(?:^|\/)test_[^/]+\.py
 const TEST_FIXTURE_EXEMPT_RE = /^(?:.*\/)?(?:tests\/(?:ci\/)?.*\.(?:test\.(?:mjs|js|ts)|py)|scripts\/test_[^/]+\.py)$/i;
 const SELF_SCRIPT_EXEMPT_RE = /(?:^|\/)\.github\/scripts\/audit-ci-integrity\.mjs$/i;
 
-const SINGLE_LINE_SKIP_RE = /\[(?:Skippable)?(?:Fact|Theory)\s*\([^)]*\bSkip\s*=/i;
-const MULTILINE_ATTR_START_RE = /\[(?:Skippable)?(?:Fact|Theory)\s*\(/i;
+const TEST_ATTR_NAME = '(?:global::)?(?:[A-Za-z_][A-Za-z0-9_]*\\.)*(?:Skippable)?(?:Fact|Theory)(?:Attribute)?';
+const SINGLE_LINE_SKIP_RE = new RegExp(`\\[\\s*${TEST_ATTR_NAME}\\s*\\([^)]*\\bSkip\\s*=`, 'i');
+const MULTILINE_ATTR_START_RE = new RegExp(`\\[\\s*${TEST_ATTR_NAME}\\s*\\(`, 'i');
 const SKIP_ARG_RE = /\bSkip\s*=/i;
-const CONTINUE_ON_ERROR_RE = /^\s*(?:-\s*)?continue-on-error\s*:\s*(?:['"]?true['"]?|['"]?\$\{\{\s*true\s*\}\}['"]?)(?:\s|$|#)/i;
-const EXIT_MASK_RE = /\|\|\s*(?:(?:true|exit\s+0)\b|:(?:\s|$|;|&&))|\|\|\s*echo\b[^\n]*::warning::/i;
+const CONTINUE_ON_ERROR_LINE_RE = /^\s*(?:-\s*)?continue-on-error\s*:\s*(.+?)(?:\s+#.*)?$/i;
+const SAFE_CONTINUE_ON_ERROR_VAL_RE = /^(?:['"]?false['"]?|['"]?\$\{\{\s*false\s*\}\}['"]?)$/i;
+const EXIT_MASK_RE = /\|\|\s*(?:(?:true|exit\s+0|echo)\b|:(?:\s|$|;|&&))/i;
+const EXIT_MASK_CONT_RE = /^(?:(?:true|exit\s+0|echo)\b|:(?:\s|$|;|&&))/i;
+const TRAILING_OR_RE = /\|\|\s*(?:\\)?$/;
 
 const TREAT_WARN_TRUE_RE = /<TreatWarningsAsErrors>\s*true\s*<\/TreatWarningsAsErrors>/i;
 const TREAT_WARN_FALSE_RE = /<TreatWarningsAsErrors>\s*false\s*<\/TreatWarningsAsErrors>/i;
@@ -54,19 +58,19 @@ const SUPPRESSION_RULES = [
   {
     exts: /\.(?:cs|razor)$/i,
     patterns: [
-      /#pragma\s+warning\s+disable\b/i,
-      /\[\s*(?:System\.Diagnostics\.CodeAnalysis\.)?SuppressMessage\b/i,
+      /#\s*pragma\s+warning\s+disable\b/i,
+      /\[\s*(?:(?:assembly|module)\s*:\s*)?(?:[A-Za-z_][A-Za-z0-9_.]*\.)?SuppressMessage(?:Attribute)?\b/i,
     ],
   },
   {
     exts: /\.(?:cs|razor|js|mjs|ts|tsx|jsx|py|sh|ya?ml)$/i,
-    patterns: [/(?:\/\/|#)\s*nosemgrep\b/i],
+    patterns: [/(?:\/\/|\/\*|#)\s*nosemgrep\b/i],
   },
   {
     exts: /\.(?:js|mjs|ts|tsx|jsx)$/i,
     patterns: [
       /(?:\/\/|\/\*)\s*eslint-disable(?:-next-line|-line)?\b/i,
-      /\/\/\s*@ts-(?:ignore|nocheck)\b/,
+      /(?:\/\/|\/\*)\s*@ts-(?:ignore|nocheck|expect-error)\b/,
     ],
   },
   {
@@ -245,27 +249,43 @@ function checkAddedLineRules(relFile, lineNum, text, state, findings, getFileLin
   }
 
   if (WORKFLOW_RE.test(relFile) && !trimmed.startsWith('#')) {
-    if (CONTINUE_ON_ERROR_RE.test(text)) {
+    const mCoe = text.match(CONTINUE_ON_ERROR_LINE_RE);
+    if (mCoe && !SAFE_CONTINUE_ON_ERROR_VAL_RE.test(mCoe[1].trim())) {
       findings.push({
         file: relFile,
         line: lineNum,
         ruleId: 'CONTINUE_ON_ERROR',
         fingerprint: normalizeFingerprint(text),
-        message: 'continue-on-error: true is forbidden in GitHub Actions workflows.',
+        message: 'Non-false continue-on-error value or expression is forbidden in GitHub Actions workflows.',
       });
     }
   }
 
   if ((WORKFLOW_RE.test(relFile) || SHELL_RE.test(relFile)) && !trimmed.startsWith('#')) {
-    const codePart = text.replace(/\s+#.*$/, '');
-    if (EXIT_MASK_RE.test(codePart)) {
+    const codePart = text.replace(/\s+#.*$/, '').trimEnd();
+    const codeTrimmed = codePart.trim();
+    if (state.pendingOrMask && codeTrimmed) {
+      if (EXIT_MASK_CONT_RE.test(codeTrimmed)) {
+        findings.push({
+          file: relFile,
+          line: lineNum,
+          ruleId: 'EXIT_CODE_MASKING',
+          fingerprint: normalizeFingerprint(text),
+          message: 'Multiline exit-code masking (|| true, || :, || exit 0, || echo) is forbidden.',
+        });
+      }
+      state.pendingOrMask = false;
+    } else if (EXIT_MASK_RE.test(codePart)) {
       findings.push({
         file: relFile,
         line: lineNum,
         ruleId: 'EXIT_CODE_MASKING',
         fingerprint: normalizeFingerprint(text),
-        message: 'Exit-code masking (|| true, || :, || exit 0, || echo ::warning::) is forbidden.',
+        message: 'Exit-code masking (|| true, || :, || exit 0, || echo) is forbidden.',
       });
+    }
+    if (codeTrimmed && TRAILING_OR_RE.test(codePart)) {
+      state.pendingOrMask = true;
     }
   }
 
@@ -311,7 +331,14 @@ export function applyBaseline(findings, baselineEntries = [], { strict = false }
   for (const entry of baselineEntries) {
     const file = normalizePath(String(entry.file || ''));
     const ruleId = String(entry.ruleId || '');
-    const count = Number.isInteger(entry.count) && entry.count > 0 ? entry.count : 1;
+    let count;
+    if (entry.count === undefined) {
+      count = 1;
+    } else if (Number.isInteger(entry.count) && entry.count >= 0) {
+      count = entry.count;
+    } else {
+      throw new Error(`Invalid baseline entry count: ${JSON.stringify(entry.count)} (must be a non-negative integer)`);
+    }
     if (entry.fingerprint) {
       const k = `${file}|${ruleId}|${normalizeFingerprint(String(entry.fingerprint))}`;
       exactCounts.set(k, (exactCounts.get(k) || 0) + count);
@@ -389,7 +416,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
   let pendingMinusFile = null;
   let isRename = false;
   let currentLine = 0;
-  const lineState = { inTestAttr: false };
+  const lineState = { inTestAttr: false, pendingOrMask: false };
   const addXmlState = { inXmlComment: false };
   const remXmlState = { inXmlComment: false };
 
@@ -399,6 +426,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
       pendingMinusFile = null;
       isRename = false;
       lineState.inTestAttr = false;
+      lineState.pendingOrMask = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
       continue;
@@ -419,6 +447,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
         touchedBuildFiles.add(pendingMinusFile);
       }
       lineState.inTestAttr = false;
+      lineState.pendingOrMask = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
       continue;
@@ -427,6 +456,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
       const src = raw.slice(4).trim();
       pendingMinusFile = src === '/dev/null' ? null : normalizePath(src.replace(/^a\//, ''));
       lineState.inTestAttr = false;
+      lineState.pendingOrMask = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
       continue;
@@ -438,6 +468,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
         firstChangedLineByFile.set(currentFile, currentLine || 1);
       }
       lineState.inTestAttr = false;
+      lineState.pendingOrMask = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
       continue;
@@ -485,6 +516,7 @@ export function auditDiffLines(diffText, deletedFiles = [], commitText = '', opt
     } else if (raw.startsWith(' ')) {
       currentLine += 1;
       lineState.inTestAttr = false;
+      lineState.pendingOrMask = false;
       addXmlState.inXmlComment = false;
       remXmlState.inXmlComment = false;
     }
@@ -581,9 +613,23 @@ export function auditRepoFiles(repoRoot) {
   for (const { full, rel } of walkFiles(repoRoot, repoRoot)) {
     const content = fs.readFileSync(full, 'utf8');
     const lines = content.split(/\r?\n/);
-    const state = { inTestAttr: false };
+    const state = { inTestAttr: false, pendingOrMask: false };
+    const xmlState = { inXmlComment: false };
+    const isBuildFile = CSPROJ_OR_BUILD_RE.test(rel);
     for (let i = 0; i < lines.length; i++) {
       checkAddedLineRules(rel, i + 1, lines[i], state, findings);
+      if (isBuildFile) {
+        const uncommented = stripXmlCommentsInLine(lines[i], xmlState);
+        if (TREAT_WARN_FALSE_RE.test(uncommented)) {
+          findings.push({
+            file: rel,
+            line: i + 1,
+            ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
+            fingerprint: normalizeFingerprint(lines[i]),
+            message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
+          });
+        }
+      }
     }
   }
   return findings;
@@ -635,10 +681,26 @@ function getGitDiffAndMeta(repoRoot, baseArg, headArg) {
     encoding: 'utf8',
     maxBuffer: 25 * 1024 * 1024,
   });
-  const delOut = execFileSync('git', ['diff', '--name-only', '--diff-filter=D', diffRange], {
+  const delOut = execFileSync('git', ['diff', '-M', '-z', '--name-status', '--diff-filter=DR', diffRange], {
     cwd: repoRoot,
     encoding: 'utf8',
   });
+  const tokens = delOut.split('\0');
+  const deletedFiles = [];
+  for (let i = 0; i < tokens.length; ) {
+    const status = tokens[i++];
+    if (!status) continue;
+    if (status.startsWith('D')) {
+      const filePath = tokens[i++];
+      if (filePath) deletedFiles.push(filePath);
+    } else if (status.startsWith('R')) {
+      const oldPath = tokens[i++];
+      const newPath = tokens[i++];
+      if (oldPath && TEST_FILE_RE.test(normalizePath(oldPath)) && (!newPath || !TEST_FILE_RE.test(normalizePath(newPath)))) {
+        deletedFiles.push(oldPath);
+      }
+    }
+  }
   const logRange = range.replace('...', '..');
   let commitText = '';
   try {
@@ -651,7 +713,7 @@ function getGitDiffAndMeta(repoRoot, baseArg, headArg) {
   }
   return {
     diffText,
-    deletedFiles: delOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+    deletedFiles,
     commitText,
     baseRef,
     headRef: rawHead,
@@ -704,7 +766,14 @@ function main() {
     findings = auditDiffLines(diffText, deletedFiles, commitText, { repoRoot, baseRef, headRef });
   }
 
-  const { baselined, unapproved } = applyBaseline(findings, baselineEntries, { strict });
+  let baselined;
+  let unapproved;
+  try {
+    ({ baselined, unapproved } = applyBaseline(findings, baselineEntries, { strict }));
+  } catch (err) {
+    console.error(`[FAIL] ${err.message}`);
+    process.exit(1);
+  }
   console.log(
     `[SUMMARY] CI Integrity scan (${scanAll ? 'full' : 'diff'}): ` +
     `baselined=${baselined.length} | unapproved=${unapproved.length}`

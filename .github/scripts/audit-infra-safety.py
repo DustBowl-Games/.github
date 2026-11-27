@@ -52,7 +52,11 @@ FROM_RE = re.compile(
 )
 USER_RE = re.compile(r"^USER\s+(?P<user>\S+)", re.IGNORECASE)
 ADD_RE = re.compile(r"^ADD\s+(?P<rest>.+)$", re.IGNORECASE)
-RUN_RE = re.compile(r"^RUN\s+(?P<rest>.+)$", re.IGNORECASE)
+RUN_RE = re.compile(r"^RUN\s+(?P<rest>.+)$", re.IGNORECASE | re.DOTALL)
+HEREDOC_START_RE = re.compile(
+    r"^(?:RUN|COPY|ADD)\b.*?(?<!<)<<(?!<)(-?)\s*['\"]?([A-Za-z_][A-Za-z0-9_-]*)['\"]?(?:\s|$)",
+    re.IGNORECASE,
+)
 CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-[A-Za-z]+\s+)*(?:0*777|a\+rwx)\b")
 PIPE_SHELL_RE = re.compile(
     r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo(?:\s+-[A-Za-z0-9-]+)*\s+|(?:/usr/bin/)?env\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash)\b",
@@ -64,7 +68,11 @@ LATEST_TAG_RE = re.compile(r":latest(?:@sha256:[0-9a-f]{64})?$", re.IGNORECASE)
 K8S_RULES = [
     (
         "K8S_INSECURE_TLS_CONNSTRING",
-        re.compile(r"(?:Trust\s*Server\s*Certificate|TrustServerCertificate)\s*=\s*(?:true|1|yes)|SslMode\s*=\s*Disable", re.IGNORECASE),
+        re.compile(
+            r"(?:Trust\s*Server\s*Certificate|TrustServerCertificate)\s*(?:=|:)\s*['\"]?(?:true|1|yes)\b"
+            r"|Ssl\s*Mode\s*(?:=|:)\s*['\"]?Disable\b",
+            re.IGNORECASE,
+        ),
         "Remove Trust Server Certificate=true / SslMode=Disable; enforce verified TLS.",
     ),
     (
@@ -99,7 +107,10 @@ K8S_RULES = [
     ),
     (
         "K8S_LATEST_IMAGE_TAG",
-        re.compile(r"^\s*(?:-\s*)?image\s*:\s*['\"]?[^\s'\"#]+:latest(?:\s|$|['\"#])", re.IGNORECASE),
+        re.compile(
+            r"^\s*(?:-\s*)?image\s*:\s*['\"]?[^\s'\"#@]+:latest(?:@sha256:[0-9a-f]{64})?(?:\s|$|['\"#])",
+            re.IGNORECASE,
+        ),
         "Pin container image tags to immutable versions or digests instead of :latest.",
     ),
 ]
@@ -109,7 +120,7 @@ READONLY_ROOTFS_TRUE_RE = re.compile(r"^\s*(?:-\s*)?readOnlyRootFilesystem\s*:\s
 READONLY_ROOTFS_FALSE_RE = re.compile(r"^\s*(?:-\s*)?readOnlyRootFilesystem\s*:\s*false(?:\s|$|#)", re.MULTILINE)
 TOYAML_SEC_CTX_RE = re.compile(r"toYaml\s+[^\n]*[sS]ecurityContext")
 VALUES_KEY_RE = re.compile(r"^(\s*)(?:-\s+)?([A-Za-z0-9_.-]+)\s*:\s*(.*)$")
-VALUES_LATEST_TAG_VAL_RE = re.compile(r"^['\"]?latest['\"]?(?:\s+#.*)?$", re.IGNORECASE)
+VALUES_LATEST_TAG_VAL_RE = re.compile(r"^['\"]?latest(?:@sha256:[0-9a-f]{64})?['\"]?(?:\s+#.*)?$", re.IGNORECASE)
 
 
 def normalize_path(rel_path: str) -> str:
@@ -129,12 +140,29 @@ def is_dockerfile_name(name: str) -> bool:
 
 
 def _collapse_dockerfile_lines(content: str) -> list[tuple[int, str]]:
-    """Return logical (1-based start line, instruction) tuples handling comments and trailing backslashes."""
+    """Return logical (1-based start line, instruction) tuples handling comments, continuations, and heredocs."""
     raw_lines = content.splitlines()
     logical: list[tuple[int, str]] = []
     buf = ""
     start_line = 0
+    heredoc_marker: str | None = None
+    heredoc_strip_tabs = False
+    heredoc_lines: list[str] = []
+
     for idx, raw in enumerate(raw_lines, start=1):
+        if heredoc_marker is not None:
+            candidate = raw.lstrip("\t").strip() if heredoc_strip_tabs else raw.strip()
+            if candidate == heredoc_marker:
+                full_stmt = buf + ("\n" + "\n".join(heredoc_lines) if heredoc_lines else "")
+                logical.append((start_line, full_stmt))
+                buf = ""
+                heredoc_marker = None
+                heredoc_strip_tabs = False
+                heredoc_lines = []
+            else:
+                heredoc_lines.append(raw)
+            continue
+
         stripped = raw.strip()
         if not buf:
             if not stripped or stripped.startswith("#"):
@@ -147,9 +175,17 @@ def _collapse_dockerfile_lines(content: str) -> list[tuple[int, str]]:
             buf += " " + raw.rstrip()[:-1].strip()
         else:
             buf = (buf + " " + stripped).strip() if buf else stripped
-            logical.append((start_line, buf))
-            buf = ""
+            m_hd = HEREDOC_START_RE.match(buf)
+            if m_hd:
+                heredoc_strip_tabs = m_hd.group(1) == "-"
+                heredoc_marker = m_hd.group(2)
+                heredoc_lines = []
+            else:
+                logical.append((start_line, buf))
+                buf = ""
     if buf:
+        if heredoc_marker is not None and heredoc_lines:
+            buf = buf + "\n" + "\n".join(heredoc_lines)
         logical.append((start_line, buf.strip()))
     return logical
 
@@ -220,28 +256,30 @@ def check_dockerfile_content(
         m_run = RUN_RE.match(stmt)
         if m_run:
             cmd = m_run.group("rest")
-            if CHMOD_777_RE.search(cmd):
+            cmd_check = re.sub(r"(?m)^\s*#.*$", "", cmd)
+            fp_cmd = re.sub(r"\s+", " ", cmd).strip()[:120]
+            if CHMOD_777_RE.search(cmd_check):
                 findings.append({
                     "file": norm_file,
                     "line": line_no,
                     "ruleId": "DOCKERFILE_CHMOD_777",
-                    "fingerprint": cmd[:120],
+                    "fingerprint": fp_cmd,
                     "message": "Overly permissive chmod 777 / a+rwx detected in Dockerfile RUN.",
                 })
-            if PIPE_SHELL_RE.search(cmd):
+            if PIPE_SHELL_RE.search(cmd_check):
                 findings.append({
                     "file": norm_file,
                     "line": line_no,
                     "ruleId": "DOCKERFILE_PIPE_TO_SHELL",
-                    "fingerprint": cmd[:120],
+                    "fingerprint": fp_cmd,
                     "message": "Unverified curl/wget pipe to shell detected in Dockerfile RUN.",
                 })
 
+    user_part = last_user.split(":", 1)[0].strip() if last_user else ""
     if has_from and (
-        not last_user
-        or last_user.lower() == "root"
-        or last_user == "0"
-        or last_user.startswith("0:")
+        not user_part
+        or user_part.lower() == "root"
+        or re.fullmatch(r"0+", user_part) is not None
     ):
         findings.append({
             "file": norm_file,
@@ -309,7 +347,9 @@ def check_k8s_helm_content(content: str, rel_path: str) -> list[dict]:
                         "fingerprint": stripped[:140],
                         "message": "Pin container image tags to immutable versions or digests instead of :latest.",
                     })
-            elif key.lower() == "image" and re.search(r"\btag\s*:\s*['\"]?latest['\"]?(?:\b|$)", val, re.IGNORECASE):
+            elif key.lower() == "image" and re.search(
+                r"\btag\s*:\s*['\"]?latest(?:@sha256:[0-9a-f]{64})?['\"]?(?:\b|$)", val, re.IGNORECASE
+            ):
                 findings.append({
                     "file": norm_file,
                     "line": line_no,
@@ -358,21 +398,28 @@ def discover_dockerfiles(repo_root: pathlib.Path) -> list[pathlib.Path]:
 
 
 def discover_k8s_helm_files(repo_root: pathlib.Path, helm_chart_dir: str = "") -> list[pathlib.Path]:
+    resolved_root = repo_root.resolve()
     roots: list[pathlib.Path] = []
     if helm_chart_dir:
-        candidate = (repo_root / helm_chart_dir).resolve()
+        candidate = (resolved_root / helm_chart_dir).resolve()
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"helm-chart-dir '{helm_chart_dir}' resolves outside repository root '{resolved_root}'"
+            ) from exc
         if candidate.exists():
             roots.append(candidate)
     else:
         for d in ("helm", "k8s", "charts"):
-            candidate = repo_root / d
+            candidate = resolved_root / d
             if candidate.is_dir():
                 roots.append(candidate)
 
     files_out: list[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
     for base in roots:
-        if base.is_file() and base.suffix.lower() in {".yml", ".yaml"}:
+        if base.is_file() and base.suffix.lower() in {".yml", ".yaml", ".tpl"}:
             if base not in seen:
                 seen.add(base)
                 files_out.append(base)
@@ -380,7 +427,7 @@ def discover_k8s_helm_files(repo_root: pathlib.Path, helm_chart_dir: str = "") -
         for root, dirs, files in os.walk(base):
             dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
             for fname in sorted(files):
-                if fname.lower().endswith((".yml", ".yaml")) and fname not in {"Chart.yaml", "Chart.lock"}:
+                if fname.lower().endswith((".yml", ".yaml", ".tpl")) and fname not in {"Chart.yaml", "Chart.lock"}:
                     p = pathlib.Path(root) / fname
                     if p not in seen:
                         seen.add(p)
@@ -406,6 +453,14 @@ def load_baseline(baseline_path: pathlib.Path | None) -> list[dict]:
     raise ValueError(f"Unsupported baseline JSON schema in {baseline_path}")
 
 
+def _parse_baseline_count(raw_cnt: object) -> int:
+    if raw_cnt is None:
+        return 1
+    if isinstance(raw_cnt, bool) or not isinstance(raw_cnt, int) or raw_cnt < 0:
+        raise ValueError(f"Baseline entry 'count' must be a non-negative integer (got {raw_cnt!r})")
+    return raw_cnt
+
+
 def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[list[dict], list[dict]]:
     exact_counts: dict[tuple[str, str, str], int] = {}
     rule_counts: dict[tuple[str, str], int] = {}
@@ -413,7 +468,7 @@ def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[
     for entry in baseline_entries:
         rel = normalize_path(str(entry.get("file", "")))
         rule_id = str(entry.get("ruleId", ""))
-        cnt = int(entry.get("count", 1) or 1)
+        cnt = _parse_baseline_count(entry.get("count"))
         fp = entry.get("fingerprint")
         if fp:
             key = (rel, rule_id, str(fp).strip())
@@ -517,13 +572,21 @@ def main(argv: list[str] | None = None) -> int:
 
     k8s_files: list[pathlib.Path] = []
     if args.check_k8s_helm:
-        k8s_files = discover_k8s_helm_files(repo_root, args.helm_chart_dir)
+        try:
+            k8s_files = discover_k8s_helm_files(repo_root, args.helm_chart_dir)
+        except ValueError as exc:
+            print(f"[FAIL] {exc}", file=sys.stderr)
+            return 1
         for kf in k8s_files:
             rel = normalize_path(str(kf.relative_to(repo_root)))
             content = kf.read_text(encoding="utf-8", errors="replace")
             findings.extend(check_k8s_helm_content(content, rel))
 
-    baselined, unapproved = apply_baseline(findings, baseline_entries)
+    try:
+        baselined, unapproved = apply_baseline(findings, baseline_entries)
+    except ValueError as exc:
+        print(f"[FAIL] Invalid baseline: {exc}", file=sys.stderr)
+        return 1
     print(
         f"[SUMMARY] Infra scan ({len(dockerfiles)} Dockerfile(s), {len(k8s_files)} K8s/Helm file(s)): "
         f"baselined={len(baselined)} | unapproved={len(unapproved)}"

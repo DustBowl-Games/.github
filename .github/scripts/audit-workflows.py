@@ -50,18 +50,32 @@ PAID_ACTION_PREFIXES = (
     "semgrep/semgrep-action",
 )
 
-SCRIPT_INJECTION_RE = re.compile(
-    r"\$\{\{[^}]*\bgithub\.(?:event\.|head_ref\b)[^}]*\}\}"
+GHA_EXPR_RE = re.compile(r"\$\{\{((?:[^'}]|'[^']*')*)\}\}", re.DOTALL)
+UNTRUSTED_GHA_EXPR_RE = re.compile(
+    r"(?:\bgithub\s*\.\s*(?:event\s*\.|head_ref\b)|github\s*\[\s*['\"]event['\"]\s*\])",
+    re.IGNORECASE,
 )
 PR_HEAD_REF_RE = re.compile(r"(?:github\.(?:event\.pull_request\.head|head_ref)|refs/pull/)", re.IGNORECASE)
-SAFE_IF_EXCLUSION_RE = re.compile(
-    r"""github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]"""
-    r"""|github\.event\.pull_request\.head\.repo\.full_name\s*==\s*github\.repository"""
+UBUNTU_LABEL_RE = re.compile(r"^ubuntu-[A-Za-z0-9._-]+$", re.IGNORECASE)
+FORK_TERNARY_UBUNTU_BRANCH_RE = re.compile(
+    r"""&&\s*(?:fromJSON\s*\(\s*)?['"](\[?\s*(?:\\?["'])?ubuntu-latest(?:\\?["'])?\s*\]?)['"]\s*\)?\s*\|\|""",
+    re.IGNORECASE,
 )
-FORK_ROUTING_RE = re.compile(
-    r"ubuntu-latest.*(?:head\.repo\.full_name\s*!=\s*github\.repository|head\.repo\.fork)"
-    r"|(?:head\.repo\.full_name\s*!=\s*github\.repository|head\.repo\.fork).*ubuntu-latest",
-    re.DOTALL,
+NON_PR_EVENT_EQ_RE = re.compile(
+    r"""^github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]$""",
+    re.IGNORECASE,
+)
+SAME_REPO_PR_EQ_RE = re.compile(
+    r"""^github\.event\.pull_request\.head\.repo\.full_name\s*==\s*github\.repository$""",
+    re.IGNORECASE,
+)
+PR_EVENT_EQ_RE = re.compile(
+    r"""^github\.event_name\s*==\s*['"]pull_request(?:_target)?['"]$""",
+    re.IGNORECASE,
+)
+SAFE_NEQ_CONJUNCT_RE = re.compile(
+    r"""^github\.(?:ref|ref_name|actor|repository)\s*!=\s*['"][^'"]+['"]$""",
+    re.IGNORECASE,
 )
 SH_SHELL_RE = re.compile(r"^(?:(?:/usr)?/bin/)?(?:sh|dash)(?:\s|$)", re.IGNORECASE)
 BASHISM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -210,6 +224,196 @@ def _strip_shell_comments(script: str) -> str:
     return "".join(out)
 
 
+def _strip_gha_expr(cond: str) -> str:
+    s = cond.strip()
+    if s.startswith("${{") and s.endswith("}}"):
+        s = s[3:-2].strip()
+    return s
+
+
+def _strip_outer_parens(expr: str) -> str:
+    s = expr.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        in_sq = False
+        in_dq = False
+        balanced_wrap = True
+        for i, ch in enumerate(s):
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif not in_sq and not in_dq:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i < len(s) - 1:
+                        balanced_wrap = False
+                        break
+        if balanced_wrap and depth == 0:
+            s = s[1:-1].strip()
+        else:
+            break
+    return s
+
+
+def _split_top_level_op(expr: str, op: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    in_sq = False
+    in_dq = False
+    start = 0
+    i = 0
+    n = len(expr)
+    op_len = len(op)
+    while i < n:
+        ch = expr[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and expr[i : i + op_len] == op:
+                parts.append(expr[start:i].strip())
+                start = i + op_len
+                i += op_len
+                continue
+        i += 1
+    parts.append(expr[start:].strip())
+    return parts
+
+
+def is_fork_isolated_runs_on(runs_on: object) -> bool:
+    """Return True when runs-on uses ubuntu-latest or routes fork PRs to ubuntu-latest."""
+    if isinstance(runs_on, str):
+        s = runs_on.strip()
+        if not s:
+            return False
+        if UBUNTU_LABEL_RE.match(s) and "self-hosted" not in s.lower():
+            return True
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                return False
+            if isinstance(parsed, list):
+                return is_fork_isolated_runs_on(parsed)
+            return False
+        inner = _strip_gha_expr(s)
+        if inner == "fromJSON(inputs.runner_labels)":
+            return True
+        if re.search(r"(?:&&\s*false\b|\bfalse\s*&&)", inner, re.IGNORECASE):
+            return False
+        m = FORK_TERNARY_UBUNTU_BRANCH_RE.search(inner)
+        if not m:
+            return False
+        before_or = inner[: m.end()]
+        has_fork_pred = (
+            re.search(r"head\.repo\.full_name\s*!=\s*github\.repository", before_or, re.IGNORECASE) is not None
+            or (
+                re.search(r"head\.repo\.fork", before_or, re.IGNORECASE) is not None
+                and not re.search(r"head\.repo\.fork\s*==\s*false", before_or, re.IGNORECASE)
+                and not re.search(r"!\s*github\.event\.pull_request\.head\.repo\.fork\b", before_or, re.IGNORECASE)
+            )
+        )
+        if not has_fork_pred:
+            return False
+        if "self-hosted" in before_or.lower():
+            return False
+        if re.search(r"!(?!=)\s*\([^)]*head\.repo\.fork", before_or, re.IGNORECASE):
+            return False
+        if re.search(r"!(?!=)\s*(?:github\.event\.pull_request\.)?head\.repo\.fork\b", before_or, re.IGNORECASE):
+            return False
+        if re.search(r"head\.repo\.fork\s*!=\s*true", before_or, re.IGNORECASE):
+            return False
+        if re.search(
+            r"""github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]""",
+            before_or,
+            re.IGNORECASE,
+        ):
+            return False
+        if re.search(r"""github\.event_name\s*!=\s*['"]pull_request(?:_target)?['"]""", before_or, re.IGNORECASE):
+            return False
+        if re.search(r"head\.repo\.full_name\s*==\s*github\.repository", before_or, re.IGNORECASE):
+            return False
+        if re.search(r"(?:1\s*==\s*0|0\s*==\s*1)", before_or):
+            return False
+        return True
+    if isinstance(runs_on, list):
+        if not runs_on:
+            return False
+        lowered = [str(x).strip().lower() for x in runs_on]
+        if any("self-hosted" in x for x in lowered):
+            return False
+        return all(UBUNTU_LABEL_RE.match(x) for x in lowered)
+    return False
+
+
+def _is_safe_non_pr_conjunct_group(expr: str, *, allow_same_repo_pr: bool) -> bool:
+    s = _strip_outer_parens(expr)
+    if not s:
+        return False
+    if re.match(r"^!\s*cancelled\s*\(\s*\)\s*&&\s*", s, re.IGNORECASE):
+        s = _strip_outer_parens(re.sub(r"^!\s*cancelled\s*\(\s*\)\s*&&\s*", "", s, count=1, flags=re.IGNORECASE))
+    disjuncts = _split_top_level_op(s, "||")
+    if len(disjuncts) > 1:
+        return all(_is_safe_non_pr_conjunct_group(d, allow_same_repo_pr=allow_same_repo_pr) for d in disjuncts)
+
+    conjuncts = _split_top_level_op(s, "&&")
+    if not conjuncts or any(not c for c in conjuncts):
+        return False
+
+    has_non_pr_event = False
+    has_same_repo_pr = False
+    for raw_c in conjuncts:
+        c = _strip_outer_parens(raw_c)
+        if not c:
+            return False
+        if re.search(r"\balways\s*\(", c, re.IGNORECASE):
+            return False
+        if "!=" in c:
+            if SAFE_NEQ_CONJUNCT_RE.match(c):
+                continue
+            return False
+        if re.fullmatch(r"true", c, re.IGNORECASE):
+            return False
+        if NON_PR_EVENT_EQ_RE.match(c):
+            has_non_pr_event = True
+            continue
+        if allow_same_repo_pr and SAME_REPO_PR_EQ_RE.match(c):
+            has_same_repo_pr = True
+            continue
+        if "pull_request" in c.lower():
+            if allow_same_repo_pr and PR_EVENT_EQ_RE.match(c):
+                continue
+            return False
+    return has_non_pr_event or has_same_repo_pr
+
+
+def is_non_pr_if_guard(cond: object, *, allow_same_repo_pr: bool = False) -> bool:
+    """Return True only when an explicit job if: restricts execution away from fork/PR events."""
+    if not isinstance(cond, str) or not cond.strip():
+        return False
+    s = _strip_gha_expr(cond)
+    if re.search(r"\balways\s*\(", s, re.IGNORECASE):
+        return False
+    if re.search(r"\|\|\s*true\b|\btrue\s*\|\|", s, re.IGNORECASE):
+        return False
+    return _is_safe_non_pr_conjunct_group(s, allow_same_repo_pr=allow_same_repo_pr)
+
+
+def _find_script_injection(run_script: str) -> str | None:
+    for m in GHA_EXPR_RE.finditer(run_script):
+        if UNTRUSTED_GHA_EXPR_RE.search(m.group(1)):
+            return m.group(0)
+    return None
+
+
 def _detect_bashism(script: str) -> str | None:
     cleaned = _strip_shell_comments(script)
     for label, pattern in BASHISM_PATTERNS:
@@ -285,12 +489,31 @@ def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
                 "message": f"Job '{job_id}' must define 'timeout-minutes'.",
             })
 
+        job_exempt_from_pr = is_non_pr_if_guard(job.get("if"), allow_same_repo_pr=not pr_target)
+
         if pr_triggered:
-            runs_on = job.get("runs-on")
-            runs_on_str = json.dumps(runs_on) if isinstance(runs_on, list) else str(runs_on or "")
-            if "self-hosted" in runs_on_str:
-                job_if = str(job.get("if") or "")
-                if not SAFE_IF_EXCLUSION_RE.search(job_if) and not FORK_ROUTING_RE.search(runs_on_str):
+            if isinstance(job_uses, str) and ORG_REUSABLE_RE.match(job_uses) and not job_exempt_from_pr:
+                with_map = job.get("with") if isinstance(job.get("with"), dict) else {}
+                runner_labels = with_map.get("runner_labels")
+                if not isinstance(runner_labels, str) or not runner_labels.strip() or not is_fork_isolated_runs_on(runner_labels):
+                    findings.append({
+                        "file": norm_file,
+                        "job": str(job_id),
+                        "ruleId": "WF_FORK_PR_RUNNER_ISOLATION",
+                        "fingerprint": f"job:{job_id}:runner_labels",
+                        "message": (
+                            f"Job '{job_id}' calls reusable workflow '{job_uses}' under pull_request "
+                            f"without fork-PR ubuntu-latest isolated 'with.runner_labels'."
+                        ),
+                    })
+            elif not job_uses:
+                runs_on = job.get("runs-on")
+                runs_on_str = json.dumps(runs_on) if isinstance(runs_on, list) else str(runs_on or "")
+                if (
+                    ("self-hosted" in runs_on_str.lower() or "dustbowl-linux" in runs_on_str.lower())
+                    and not job_exempt_from_pr
+                    and not is_fork_isolated_runs_on(runs_on)
+                ):
                     findings.append({
                         "file": norm_file,
                         "job": str(job_id),
@@ -348,14 +571,14 @@ def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
 
             run_script = step.get("run")
             if isinstance(run_script, str):
-                m_inj = SCRIPT_INJECTION_RE.search(run_script)
-                if m_inj:
+                inj_match = _find_script_injection(run_script)
+                if inj_match:
                     findings.append({
                         "file": norm_file,
                         "job": str(job_id),
                         "ruleId": "WF_NO_SCRIPT_INJECTION",
-                        "fingerprint": m_inj.group(0),
-                        "message": f"Untrusted expression {m_inj.group(0)} interpolated in run: script; bind via env: instead.",
+                        "fingerprint": inj_match,
+                        "message": f"Untrusted expression {inj_match} interpolated in run: script; bind via env: instead.",
                     })
                 if has_container:
                     eff_shell = _resolve_step_shell(wf_shell, job_shell, step)
@@ -447,6 +670,14 @@ def load_baseline(baseline_path: pathlib.Path | None) -> list[dict]:
     raise ValueError(f"Unsupported baseline schema in {baseline_path}")
 
 
+def _parse_baseline_count(raw_cnt: object) -> int:
+    if raw_cnt is None:
+        return 1
+    if isinstance(raw_cnt, bool) or not isinstance(raw_cnt, int) or raw_cnt < 0:
+        raise ValueError(f"Baseline entry 'count' must be a non-negative integer (got {raw_cnt!r})")
+    return raw_cnt
+
+
 def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[list[dict], list[dict]]:
     exact_counts: dict[tuple[str, str, str], int] = {}
     rule_counts: dict[tuple[str, str], int] = {}
@@ -454,7 +685,7 @@ def apply_baseline(findings: list[dict], baseline_entries: list[dict]) -> tuple[
     for entry in baseline_entries:
         rel = normalize_path(str(entry.get("file", "")))
         rule_id = str(entry.get("ruleId", ""))
-        cnt = int(entry.get("count", 1) or 1)
+        cnt = _parse_baseline_count(entry.get("count"))
         fp = entry.get("fingerprint")
         if fp:
             key = (rel, rule_id, str(fp).strip())
@@ -561,7 +792,11 @@ def main(argv: list[str] | None = None) -> int:
         skip_actionlint=args.skip_actionlint,
         actionlint_bin=args.actionlint_bin,
     )
-    baselined, unapproved = apply_baseline(findings, baseline_entries)
+    try:
+        baselined, unapproved = apply_baseline(findings, baseline_entries)
+    except ValueError as exc:
+        print(f"[FAIL] Invalid baseline: {exc}", file=sys.stderr)
+        return 1
 
     wf_count = len(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml")))
     print(
