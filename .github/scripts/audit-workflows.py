@@ -52,7 +52,7 @@ PAID_ACTION_PREFIXES = (
 
 GHA_EXPR_RE = re.compile(r"\$\{\{((?:[^'}]|'(?:[^']|'')*'|\}(?!\}))*)\}\}", re.DOTALL)
 UNTRUSTED_GHA_EXPR_RE = re.compile(
-    r"(?:\bgithub\s*\.\s*(?:event\s*\.|head_ref\b)|github\s*\[\s*['\"]event['\"]\s*\])",
+    r"\bgithub(?:\s*\.\s*(?:event\b|head_ref\b)|\s*\[\s*['\"](?:event|head_ref)['\"]\s*\])",
     re.IGNORECASE,
 )
 PR_HEAD_REF_RE = re.compile(r"(?:github\.(?:event\.pull_request\.head|head_ref)|refs/pull/)", re.IGNORECASE)
@@ -307,17 +307,21 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
         inner = _strip_gha_expr(s)
         if inner == "fromJSON(inputs.runner_labels)":
             return True
-        if re.search(r"(?:&&\s*false\b|\bfalse\s*&&)", inner, re.IGNORECASE):
+        if re.search(r"(?:&&\s*false\s*(?:$|[)&|])|(?:^|[(&|])\s*false\s*&&)", inner, re.IGNORECASE):
             return False
         m = FORK_TERNARY_UBUNTU_BRANCH_RE.search(inner)
         if not m:
             return False
         before_or = inner[: m.end()]
+        falsy_lit = r"(?:\b(?:false|0|null)\b|['\"]false['\"]|['\"]{2})"
+        truthy_lit = r"(?:\b(?:true|1)\b|['\"]true['\"])"
+        fork_prop = r"(?:github\.event\.pull_request\.)?head\.repo\.fork\b"
         has_fork_pred = (
             re.search(r"head\.repo\.full_name\s*!=\s*github\.repository", before_or, re.IGNORECASE) is not None
             or (
                 re.search(r"head\.repo\.fork", before_or, re.IGNORECASE) is not None
-                and not re.search(r"head\.repo\.fork\s*==\s*false", before_or, re.IGNORECASE)
+                and not re.search(rf"head\.repo\.fork\s*==\s*{falsy_lit}", before_or, re.IGNORECASE)
+                and not re.search(rf"{falsy_lit}\s*==\s*{fork_prop}", before_or, re.IGNORECASE)
                 and not re.search(r"!\s*github\.event\.pull_request\.head\.repo\.fork\b", before_or, re.IGNORECASE)
             )
         )
@@ -329,7 +333,13 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
             return False
         if re.search(r"!(?!=)\s*(?:github\.event\.pull_request\.)?head\.repo\.fork\b", before_or, re.IGNORECASE):
             return False
-        if re.search(r"head\.repo\.fork\s*!=\s*true", before_or, re.IGNORECASE):
+        if re.search(rf"head\.repo\.fork\s*==\s*{falsy_lit}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"head\.repo\.fork\s*!=\s*{truthy_lit}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"{falsy_lit}\s*==\s*{fork_prop}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"{truthy_lit}\s*!=\s*{fork_prop}", before_or, re.IGNORECASE):
             return False
         if re.search(
             r"""github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]""",
