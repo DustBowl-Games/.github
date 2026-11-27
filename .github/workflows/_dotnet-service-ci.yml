@@ -80,6 +80,9 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    defaults:
+      run:
+        shell: bash
     container:
       image: ${{ inputs.sdk_image }}
       options: --security-opt=no-new-privileges

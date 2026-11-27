@@ -15,6 +15,7 @@ Runs actionlint (with shellcheck when available) plus deterministic contract che
   inside step run: scripts (pass via env: instead)
 - WF_NO_PULL_REQUEST_TARGET_HEAD_CHECKOUT: Ban checking out PR head under pull_request_target
 - WF_NO_PAID_ACTIONS: Ban paid/GHAS actions (R4 zero-spend enforcement)
+- WF_CONTAINER_BASH_SHELL: Container jobs using bashisms must declare defaults.run.shell: bash or step-level shell: bash
 """
 
 from __future__ import annotations
@@ -61,6 +62,25 @@ FORK_ROUTING_RE = re.compile(
     r"ubuntu-latest.*(?:head\.repo\.full_name\s*!=\s*github\.repository|head\.repo\.fork)"
     r"|(?:head\.repo\.full_name\s*!=\s*github\.repository|head\.repo\.fork).*ubuntu-latest",
     re.DOTALL,
+)
+SH_SHELL_RE = re.compile(r"^(?:(?:/usr)?/bin/)?(?:sh|dash)(?:\s|$)", re.IGNORECASE)
+BASHISM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("set -o pipefail", re.compile(r"(?:^|[;&|\s])set\s+[^\n;#&|]*\bpipefail\b")),
+    ("bash array assignment", re.compile(r"(?:^|[;\s])[A-Za-z_][A-Za-z0-9_]*\+?\=\(")),
+    ("bash array expansion", re.compile(r"\$\{[#!]?[A-Za-z_][A-Za-z0-9_]*\[[^\]]+\]\}")),
+    ("extended test [[ ... ]]", re.compile(r"(?:^|[;\s(|&])\[\[(?:\s|$)")),
+    (
+        "bash builtin (shopt/declare/typeset/readarray/mapfile)",
+        re.compile(
+            r"(?:(?:^|[;\n]|&&|\|\|)\s*|(?:\bif|\bthen|\belse)\s+)(?:shopt|declare|typeset|readarray|mapfile)\b"
+        ),
+    ),
+    ("source builtin", re.compile(r"(?:^|[;\n]|&&|\|\|)\s*source\s+[^\s;|&]")),
+    ("here-string <<<", re.compile(r"(?:^|[^<])<<<(?!<)")),
+    ("process substitution", re.compile(r"(?:^|\s)[<>]\(")),
+    ("bash case expansion", re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:,,?|\^\^?)")),
+    ("function keyword", re.compile(r"(?:^|[;\n]|&&|\|\|)\s*function\s+[A-Za-z_][A-Za-z0-9_]*\b")),
+    ("&> redirection", re.compile(r"(?:^|\s)&>>?\s*\S")),
 )
 
 
@@ -112,6 +132,92 @@ def is_paid_action(uses: str) -> bool:
     return any(lower.startswith(prefix) for prefix in PAID_ACTION_PREFIXES)
 
 
+def _get_default_run_shell(mapping: object) -> str:
+    if not isinstance(mapping, dict):
+        return ""
+    defaults = mapping.get("defaults")
+    if not isinstance(defaults, dict):
+        return ""
+    run_defaults = defaults.get("run")
+    if not isinstance(run_defaults, dict):
+        return ""
+    shell = run_defaults.get("shell")
+    return shell.strip() if isinstance(shell, str) else ""
+
+
+def _resolve_step_shell(wf_shell: str, job_shell: str, step: dict) -> str:
+    step_shell = step.get("shell")
+    if isinstance(step_shell, str) and step_shell.strip():
+        return step_shell.strip()
+    if job_shell:
+        return job_shell
+    if wf_shell:
+        return wf_shell
+    return ""
+
+
+def _strip_shell_comments(script: str) -> str:
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    n = len(script)
+    while i < n:
+        ch = script[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            out.append(ch)
+            if ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == "'":
+            out.append(ch)
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            out.append(ch)
+            in_double = True
+            i += 1
+            continue
+        if ch == "#":
+            prev_ch = script[i - 1] if i > 0 else ""
+            if prev_ch in ("", "\n", "\r", " ", "\t", ";", "&", "|", "(", ")"):
+                while i < n and script[i] != "\n":
+                    i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _detect_bashism(script: str) -> str | None:
+    cleaned = _strip_shell_comments(script)
+    for label, pattern in BASHISM_PATTERNS:
+        if pattern.search(cleaned):
+            return label
+    return None
+
+
 def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
     findings: list[dict] = []
     norm_file = normalize_path(rel_file)
@@ -131,10 +237,14 @@ def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
     has_top_perms = isinstance(top_perms, dict) and len(top_perms) > 0
     pr_triggered = has_pr_trigger(triggers)
     pr_target = has_pr_target_trigger(triggers)
+    wf_shell = _get_default_run_shell(doc)
 
     for job_id, job in doc["jobs"].items():
         if not isinstance(job, dict):
             continue
+
+        has_container = bool(job.get("container"))
+        job_shell = _get_default_run_shell(job)
 
         job_uses = job.get("uses")
         if isinstance(job_uses, str):
@@ -247,6 +357,22 @@ def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
                         "fingerprint": m_inj.group(0),
                         "message": f"Untrusted expression {m_inj.group(0)} interpolated in run: script; bind via env: instead.",
                     })
+                if has_container:
+                    eff_shell = _resolve_step_shell(wf_shell, job_shell, step)
+                    if eff_shell == "" or SH_SHELL_RE.match(eff_shell):
+                        bashism = _detect_bashism(run_script)
+                        if bashism:
+                            findings.append({
+                                "file": norm_file,
+                                "job": str(job_id),
+                                "ruleId": "WF_CONTAINER_BASH_SHELL",
+                                "fingerprint": f"job:{job_id}:step:{idx}:container-shell",
+                                "message": (
+                                    f"Step {idx} in container job '{job_id}' uses bashism ({bashism}) "
+                                    f"under '{eff_shell or 'default /bin/sh'}'; set 'defaults.run.shell: bash' "
+                                    f"or step-level 'shell: bash'."
+                                ),
+                            })
 
     return findings
 
