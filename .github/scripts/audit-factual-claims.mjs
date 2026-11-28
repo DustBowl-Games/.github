@@ -423,6 +423,26 @@ export function collectTargetFiles(repoRoot = REPO_ROOT) {
     .sort((a, b) => a.rel.localeCompare(b.rel));
 }
 
+function readHeadFileContent(repoRoot, headRef, relFile) {
+  if (repoRoot && headRef) {
+    try {
+      return execFileSync('git', ['show', `${headRef}:${normalizePath(relFile)}`], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      // Fallback to working tree file if git show is unavailable
+    }
+  }
+  const abs = path.join(repoRoot, relFile);
+  if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+    return fs.readFileSync(abs, 'utf8');
+  }
+  return null;
+}
+
 function getDiffAddedLines(repoRoot = REPO_ROOT, baseArg = '', headArg = '') {
   const baseSha = baseArg || process.env.GITHUB_BASE_SHA || '';
   const headSha = headArg || process.env.GITHUB_HEAD_SHA || '';
@@ -434,9 +454,11 @@ function getDiffAddedLines(repoRoot = REPO_ROOT, baseArg = '', headArg = '') {
 
   let diffRange = null;
   let explicitShas = false;
+  let headRef = 'HEAD';
   if (baseSha && headSha) {
     explicitShas = true;
     diffRange = `${baseSha}...${headSha}`;
+    headRef = headSha;
   } else {
     try {
       execFileSync('git', ['rev-parse', '--verify', `origin/${baseRef}`], { cwd: repoRoot, stdio: 'ignore' });
@@ -494,6 +516,19 @@ function getDiffAddedLines(repoRoot = REPO_ROOT, baseArg = '', headArg = '') {
 
   const findings = [];
   for (const [rel, addedLines] of perFile.entries()) {
+    if (rel.endsWith('.cs') || rel.endsWith('.razor')) {
+      const headContent = readHeadFileContent(repoRoot, headRef, rel);
+      if (typeof headContent === 'string') {
+        const addedLineNums = new Set(addedLines.map(l => l.lineNum));
+        const fileFindings = auditText(headContent, rel);
+        for (const f of fileFindings) {
+          if (addedLineNums.has(f.line)) {
+            findings.push(f);
+          }
+        }
+        continue;
+      }
+    }
     const synthetic = addedLines.map(l => l.text).join('\n');
     const fileFindings = auditText(synthetic, rel);
     for (const f of fileFindings) {

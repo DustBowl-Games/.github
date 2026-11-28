@@ -500,3 +500,22 @@ test('auditRepoFiles (--all) catches TreatWarningsAsErrors=false while ignoring 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('blocks global::-prefixed SuppressMessage attributes while allowing benign global:: attributes', () => {
+  const diff = [
+    '+++ b/src/GlobalSuppressed.cs',
+    '@@ -1,0 +1,4 @@',
+    '+[global::System.Diagnostics.CodeAnalysis.SuppressMessage("Cat", "Id")]',
+    '+[assembly: global::System.Diagnostics.CodeAnalysis.SuppressMessageAttribute("Cat", "Id")]',
+    '+[global::System.ComponentModel.DataAnnotations.Display(Name = "SuppressMessage")]',
+    '+[global::Xunit.Fact]',
+  ].join('\n');
+
+  const findings = auditDiffLines(diff, [], '');
+  const supFindings = findings.filter(f => f.ruleId === 'NEW_SUPPRESSION_DIRECTIVE');
+  assert.equal(supFindings.length, 2);
+  assert.deepEqual(
+    supFindings.map(f => f.line),
+    [1, 2]
+  );
+});

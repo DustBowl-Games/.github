@@ -309,3 +309,124 @@ test('CLI diff mode fails closed when GITHUB_BASE_SHA / GITHUB_HEAD_SHA fail git
     fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });
+
+test('CLI diff mode audits lines added inside existing C# and Razor multi-line raw string literals without flagging untouched lines', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-rawdiff-test-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(tmpRepo, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(tmpRepo, 'Services'), { recursive: true });
+    fs.mkdirSync(path.join(tmpRepo, 'Components', 'Pages'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'config', 'verified-claims-allowlist.json'),
+      JSON.stringify({ schemaVersion: 1, verifiedFacts: [], legacyAuditBaseline: [] })
+    );
+
+    const seedPath = path.join(tmpRepo, 'Services', 'SeedArticles.cs');
+    const faqPath = path.join(tmpRepo, 'Components', 'Pages', 'Faq.razor');
+
+    fs.writeFileSync(
+      seedPath,
+      [
+        'public class SeedArticles {',
+        '  string Legacy = """',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  """;',
+        '  string Body = """',
+        '    Clean line 1.',
+        '    Clean line 2.',
+        '  """;',
+        '}',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      faqPath,
+      [
+        '<h1>FAQ</h1>',
+        '@code {',
+        '  private string Note = """',
+        '    Clean razor raw line.',
+        '  """;',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: initial']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    // Positive: adding clean lines inside existing raw strings ignores untouched legacy line 3
+    fs.writeFileSync(
+      seedPath,
+      [
+        'public class SeedArticles {',
+        '  string Legacy = """',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  """;',
+        '  string Body = """',
+        '    Clean line 1.',
+        '    Owned bare-metal servers in Hickory, NC.',
+        '    Clean line 2.',
+        '  """;',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'docs: add clean raw line']);
+    const cleanHeadSha = git(['rev-parse', 'HEAD']).trim();
+
+    const cleanRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', cleanHeadSha],
+      { encoding: 'utf8' }
+    );
+    assert.equal(cleanRes.status, 0, cleanRes.stderr);
+
+    // Negative: adding unverified claims inside existing C# and Razor raw string literals fails
+    fs.writeFileSync(
+      seedPath,
+      [
+        'public class SeedArticles {',
+        '  string Legacy = """',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  """;',
+        '  string Body = """',
+        '    Clean line 1.',
+        '    We guarantee 24/7 support and 99.9% uptime.',
+        '    Clean line 2.',
+        '  """;',
+        '}',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      faqPath,
+      [
+        '<h1>FAQ</h1>',
+        '@code {',
+        '  private string Note = """',
+        '    Clean razor raw line.',
+        '    Same Business Day response SLA.',
+        '  """;',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'docs: add unverified raw string claims']);
+    const badHeadSha = git(['rev-parse', 'HEAD']).trim();
+
+    const badRes = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', cleanHeadSha, '--head', badHeadSha],
+      { encoding: 'utf8' }
+    );
+    assert.equal(badRes.status, 1);
+    assert.match(badRes.stderr, /UNAPPROVED_24_7_CLAIM/);
+    assert.match(badRes.stderr, /UNAPPROVED_SLA_PERCENT/);
+    assert.match(badRes.stderr, /UNAPPROVED_RESPONSE_SLA/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});

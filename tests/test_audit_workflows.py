@@ -434,6 +434,8 @@ class AuditWorkflowsTests(unittest.TestCase):
         for safe_expr in (
             "${{ format('{0}', github.repository) }}",
             "${{ format('can''t {0}', github.repository) }}",
+            "${{ github.event_name }}",
+            "${{ github['event_name'] }}",
         ):
             with self.subTest(safe_expr=safe_expr):
                 safe_doc = {
@@ -448,6 +450,82 @@ class AuditWorkflowsTests(unittest.TestCase):
                     },
                 }
                 self.assertEqual(audit_workflows.audit_workflow_doc(safe_doc, ".github/workflows/safe.yml"), [])
+
+    def test_blocks_bracket_head_ref_event_subscript_and_tojson_script_injection(self):
+        for expr in (
+            "${{ github.event['pull_request']['title'] }}",
+            "${{ github['head_ref'] }}",
+            "${{ toJSON(github.event) }}",
+            "${{ github['event']['comment']['body'] }}",
+        ):
+            with self.subTest(expr=expr):
+                doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": "ubuntu-latest",
+                            "timeout-minutes": 5,
+                            "steps": [{"run": f'echo "{expr}"'}],
+                        }
+                    },
+                }
+                findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/inj2.yml")
+                self.assertEqual([f["ruleId"] for f in findings], ["WF_NO_SCRIPT_INJECTION"])
+
+    def test_rejects_falsy_and_inverted_fork_comparisons_while_allowing_truthy_variants(self):
+        base_step = [{"uses": PINNED_CHECKOUT, "with": {"persist-credentials": False}}]
+        unsafe_runs_on = (
+            "${{ github.event.pull_request.head.repo.fork == 0 && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork == 'false' && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork == null && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork != 1 && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork != 'true' && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ false == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ 0 == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ 'false' == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ null == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ true != github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ 1 != github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ 'true' != github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+        )
+        for runs_on in unsafe_runs_on:
+            with self.subTest(unsafe_runs_on=runs_on):
+                doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": runs_on,
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                }
+                findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/fork-bad.yml")
+                self.assertEqual([f["ruleId"] for f in findings], ["WF_FORK_PR_RUNNER_ISOLATION"])
+
+        safe_runs_on = (
+            "${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork == true && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ true == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.head.repo.fork != false && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ false != github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+        )
+        for runs_on in safe_runs_on:
+            with self.subTest(safe_runs_on=runs_on):
+                doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": runs_on,
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                }
+                self.assertEqual(audit_workflows.audit_workflow_doc(doc, ".github/workflows/fork-ok.yml"), [])
 
 
 if __name__ == "__main__":

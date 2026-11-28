@@ -59,7 +59,7 @@ const SUPPRESSION_RULES = [
     exts: /\.(?:cs|razor)$/i,
     patterns: [
       /#\s*pragma\s+warning\s+disable\b/i,
-      /\[\s*(?:(?:assembly|module)\s*:\s*)?(?:[A-Za-z_][A-Za-z0-9_.]*\.)?SuppressMessage(?:Attribute)?\b/i,
+      /\[\s*(?:(?:assembly|module)\s*:\s*)?(?:global::)?(?:[A-Za-z_][A-Za-z0-9_.]*\.)?SuppressMessage(?:Attribute)?\b/i,
     ],
   },
   {
