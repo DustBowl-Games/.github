@@ -527,6 +527,72 @@ class AuditWorkflowsTests(unittest.TestCase):
                 }
                 self.assertEqual(audit_workflows.audit_workflow_doc(doc, ".github/workflows/fork-ok.yml"), [])
 
+    def test_blocks_r3_fork_isolation_bypasses_and_custom_runners_while_allowing_hosted_runners(self):
+        base_step = [{"uses": PINNED_CHECKOUT, "with": {"persist-credentials": False}}]
+        unsafe_runs_on_cases = (
+            ("fork_eq_str_true", "${{ github.event.pull_request.head.repo.fork == 'true' && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("str_true_eq_fork", "${{ 'true' == github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("fork_eq_dbl_true", '${{ github.event.pull_request.head.repo.fork == "true" && \'ubuntu-latest\' || \'self-hosted\' }}'),
+            ("nested_paren_neg_fork", "${{ !((1 == 1) && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("nested_paren_neg_full_name", "${{ !((1 == 1) && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("and_zero", "${{ (github.event.pull_request.head.repo.fork && 0) && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("zero_and", "${{ (0 && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("and_null", "${{ (github.event.pull_request.head.repo.fork && null) && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("and_empty_sq", "${{ (github.event.pull_request.head.repo.fork && '') && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("and_empty_dq", '${{ (github.event.pull_request.head.repo.fork && "") && \'ubuntu-latest\' || \'self-hosted\' }}'),
+            ("fork_neq_fork", "${{ github.event.pull_request.head.repo.fork != github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("full_name_neq_self", "${{ github.event.pull_request.head.repo.full_name != github.event.pull_request.head.repo.full_name && 'ubuntu-latest' || 'self-hosted' }}"),
+            ("custom_runner_str", "DB-Runner01"),
+            ("custom_runner_list", ["DB-Runner01"]),
+            ("dustbowl_linux", "dustbowl-linux"),
+        )
+        for label, runs_on in unsafe_runs_on_cases:
+            for trig in ("pull_request", "pull_request_target"):
+                with self.subTest(case=label, trigger=trig):
+                    doc = {
+                        True: {trig: {}},
+                        "permissions": {"contents": "read"},
+                        "jobs": {
+                            "j": {
+                                "runs-on": runs_on,
+                                "timeout-minutes": 5,
+                                "steps": base_step,
+                            }
+                        },
+                    }
+                    findings = audit_workflows.audit_workflow_doc(doc, ".github/workflows/r3-bad.yml")
+                    self.assertEqual([f["ruleId"] for f in findings], ["WF_FORK_PR_RUNNER_ISOLATION"])
+
+        safe_runs_on_cases = (
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            "ubuntu-22.04",
+            "windows-latest",
+            "windows-2022",
+            "macos-latest",
+            "macos-14",
+            ["ubuntu-latest"],
+            ["windows-latest"],
+            ["macos-14"],
+            "${{ !((github.event.pull_request.draft)) && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+            "${{ github.event.pull_request.comments != 0 && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'self-hosted' }}",
+        )
+        for runs_on in safe_runs_on_cases:
+            with self.subTest(safe_runs_on=runs_on):
+                self.assertTrue(audit_workflows.is_fork_isolated_runs_on(runs_on))
+                doc = {
+                    True: {"pull_request": {}},
+                    "permissions": {"contents": "read"},
+                    "jobs": {
+                        "j": {
+                            "runs-on": runs_on,
+                            "timeout-minutes": 5,
+                            "steps": base_step,
+                        }
+                    },
+                }
+                self.assertEqual(audit_workflows.audit_workflow_doc(doc, ".github/workflows/r3-ok.yml"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

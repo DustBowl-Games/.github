@@ -59,7 +59,7 @@ HEREDOC_START_RE = re.compile(
 )
 CHMOD_777_RE = re.compile(r"\bchmod\s+(?:-[A-Za-z]+\s+)*(?:0*777|a\+rwx)\b")
 PIPE_SHELL_RE = re.compile(
-    r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo(?:\s+-[A-Za-z0-9-]+)*\s+|(?:/usr/bin/)?env\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash)\b",
+    r"\b(?:curl|wget|fetch|iwr|irm)\b(?:(?!&&|\|\||;|\n).)*\|(?!\|)\s*(?:sudo(?:\s+-[A-Za-z0-9-]+)*\s+|(?:/usr/bin/)?env\s+)*(?:/(?:usr/(?:local/)?)?bin/)?(?:sh|bash|zsh|ash|dash|pwsh|powershell)\b",
     re.IGNORECASE,
 )
 SHA256_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$", re.IGNORECASE)

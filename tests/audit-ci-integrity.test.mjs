@@ -519,3 +519,68 @@ test('blocks global::-prefixed SuppressMessage attributes while allowing benign 
     [1, 2]
   );
 });
+
+test('blocks conditional TreatWarningsAsErrors=false while allowing conditional true in diff and --all modes', () => {
+  const diffCondFalse = [
+    '+++ b/src/App.csproj',
+    '@@ -4,0 +4,1 @@',
+    '+  <TreatWarningsAsErrors Condition="\'$(Configuration)\' == \'Release\'">false</TreatWarningsAsErrors>',
+  ].join('\n');
+  const fFalse = auditDiffLines(diffCondFalse, [], '');
+  assert.equal(fFalse.some(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED'), true);
+
+  const diffCondTrue = [
+    '+++ b/src/App.csproj',
+    '@@ -4,0 +4,1 @@',
+    '+  <TreatWarningsAsErrors Condition="\'$(Configuration)\' == \'Release\'">true</TreatWarningsAsErrors>',
+  ].join('\n');
+  const fTrue = auditDiffLines(diffCondTrue, [], '');
+  assert.equal(fTrue.some(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED'), false);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-integrity-condwarn-'));
+  try {
+    const csproj = path.join(tmpDir, 'App.csproj');
+    fs.writeFileSync(
+      csproj,
+      '<Project><PropertyGroup><TreatWarningsAsErrors Condition="\'$(Configuration)\' == \'Release\'">true</TreatWarningsAsErrors></PropertyGroup></Project>\n'
+    );
+    assert.equal(
+      auditRepoFiles(tmpDir).filter(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED').length,
+      0
+    );
+
+    fs.writeFileSync(
+      csproj,
+      '<Project><PropertyGroup><TreatWarningsAsErrors Condition="\'$(Configuration)\' == \'Release\'">false</TreatWarningsAsErrors></PropertyGroup></Project>\n'
+    );
+    assert.equal(
+      auditRepoFiles(tmpDir).filter(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED').length,
+      1
+    );
+
+    fs.writeFileSync(
+      csproj,
+      '<Project>\n  <PropertyGroup>\n    <TreatWarningsAsErrors\n      Condition="\'$(Configuration)\' == \'Debug\'">\n      false\n    </TreatWarningsAsErrors>\n  </PropertyGroup>\n</Project>\n'
+    );
+    assert.equal(
+      auditRepoFiles(tmpDir).filter(f => f.ruleId === 'TREAT_WARNINGS_AS_ERRORS_WEAKENED').length,
+      1
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Allow-Test-Removal requires a non-whitespace reason on the same line and rejects newline-spanning trailers', () => {
+  const emptyTrailerMsg = 'chore: cleanup\n\nAllow-Test-Removal:\nSigned-off-by: dev';
+  const f1 = auditDiffLines('', ['tests/AuthTests.cs'], emptyTrailerMsg);
+  assert.equal(f1.filter(f => f.ruleId === 'UNAPPROVED_TEST_DELETION').length, 1);
+
+  const spacesOnlyMsg = 'chore: cleanup\n\nAllow-Test-Removal:   \r\nSigned-off-by: dev';
+  const f2 = auditDiffLines('', ['tests/AuthTests.cs'], spacesOnlyMsg);
+  assert.equal(f2.filter(f => f.ruleId === 'UNAPPROVED_TEST_DELETION').length, 1);
+
+  const validMsg = 'chore: cleanup\n\nAllow-Test-Removal: replaced by integration suite\nSigned-off-by: dev';
+  const f3 = auditDiffLines('', ['tests/AuthTests.cs'], validMsg);
+  assert.equal(f3.filter(f => f.ruleId === 'UNAPPROVED_TEST_DELETION').length, 0);
+});

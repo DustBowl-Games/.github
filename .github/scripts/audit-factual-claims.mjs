@@ -132,8 +132,134 @@ function stripHtmlAttributes(line) {
     .replace(/\b(?:class|href|src|d|viewBox)=@\w+/gi, ' ');
 }
 
+function scanCSharpInterpolation(rawLine, startIdx, rawState, literals) {
+  let i = startIdx;
+  const n = rawLine.length;
+  while (i < n && rawState.interpDepth > 0) {
+    const ch = rawLine[i];
+    if (ch === "'") {
+      if (rawLine[i + 1] === '\\' && i + 3 < n && rawLine[i + 3] === "'") {
+        i += 4;
+        continue;
+      }
+      if (i + 2 < n && rawLine[i + 2] === "'") {
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      const isVerbatimPrefix = i >= 1 && rawLine[i - 1] === '@';
+      if (isVerbatimPrefix) {
+        let j = i + 1;
+        let vbuf = '';
+        while (j < n) {
+          if (rawLine[j] === '"') {
+            if (rawLine[j + 1] === '"') {
+              vbuf += '"';
+              j += 2;
+              continue;
+            }
+            if (vbuf.trim()) literals.push(vbuf.trim());
+            j++;
+            break;
+          }
+          vbuf += rawLine[j];
+          j++;
+        }
+        i = j;
+        continue;
+      }
+      let j = i + 1;
+      while (j < n) {
+        if (rawLine[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (rawLine[j] === '"') {
+          const inner = rawLine.slice(i + 1, j);
+          if (inner) literals.push(inner);
+          j++;
+          break;
+        }
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    if (ch === '{') {
+      rawState.interpDepth++;
+    } else if (ch === '}') {
+      rawState.interpDepth--;
+      if (rawState.interpDepth === 0) {
+        i++;
+        break;
+      }
+    }
+    i++;
+  }
+  return i;
+}
+
+function scanVerbatimFrom(rawLine, startIdx, rawState, literals) {
+  let i = startIdx;
+  const n = rawLine.length;
+  let buf = '';
+  while (i < n) {
+    if (rawState.interpDepth > 0) {
+      i = scanCSharpInterpolation(rawLine, i, rawState, literals);
+      continue;
+    }
+    const ch = rawLine[i];
+    if (rawState.verbatimInterpolated) {
+      if (ch === '{') {
+        if (rawLine[i + 1] === '{') {
+          buf += '{';
+          i += 2;
+          continue;
+        }
+        buf += ' ';
+        rawState.interpDepth = 1;
+        i = scanCSharpInterpolation(rawLine, i + 1, rawState, literals);
+        continue;
+      }
+      if (ch === '}') {
+        if (rawLine[i + 1] === '}') {
+          buf += '}';
+          i += 2;
+          continue;
+        }
+        buf += '}';
+        i += 1;
+        continue;
+      }
+    }
+    if (ch === '"') {
+      if (rawLine[i + 1] === '"') {
+        buf += '"';
+        i += 2;
+        continue;
+      }
+      if (buf.trim()) literals.push(buf.trim());
+      rawState.inVerbatim = false;
+      rawState.verbatimInterpolated = false;
+      rawState.interpDepth = 0;
+      return i + 1;
+    }
+    buf += ch;
+    i += 1;
+  }
+  if (buf.trim()) literals.push(buf.trim());
+  return n;
+}
+
 function extractCSharpLineLiterals(rawLine, rawState) {
   const literals = [];
+  rawState.lastBraceDelta = 0;
+  let i = 0;
+  const n = rawLine.length;
+
   if (rawState.inRaw) {
     const closeRe = new RegExp(`"{${rawState.quoteLen},}`);
     const m = rawLine.match(closeRe);
@@ -146,21 +272,54 @@ function extractCSharpLineLiterals(rawLine, rawState) {
     if (beforeClose) literals.push(beforeClose);
     rawState.inRaw = false;
     rawState.quoteLen = 0;
-    const rest = rawLine.slice(m.index + m[0].length);
-    if (rest) {
-      literals.push(...extractCSharpLineLiterals(rest, rawState));
-    }
-    return literals;
+    i = m.index + m[0].length;
+  } else if (rawState.inVerbatim) {
+    i = scanVerbatimFrom(rawLine, 0, rawState, literals);
   }
 
-  let i = 0;
-  const n = rawLine.length;
   while (i < n) {
     const ch = rawLine[i];
     if (ch === '/' && rawLine[i + 1] === '/') {
       break;
     }
+    if (ch === '{') {
+      rawState.lastBraceDelta++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      rawState.lastBraceDelta--;
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      if (rawLine[i + 1] === '\\' && i + 3 < n && rawLine[i + 3] === "'") {
+        i += 4;
+        continue;
+      }
+      if (i + 2 < n && rawLine[i + 2] === "'") {
+        i += 3;
+        continue;
+      }
+      i++;
+      continue;
+    }
     if (ch === '"') {
+      const isVerbatim = i >= 1 && (
+        rawLine[i - 1] === '@' ||
+        (i >= 2 && rawLine[i - 2] === '@' && rawLine[i - 1] === '$')
+      );
+      if (isVerbatim) {
+        const isInterpolated = i >= 2 && (
+          (rawLine[i - 2] === '$' && rawLine[i - 1] === '@') ||
+          (rawLine[i - 2] === '@' && rawLine[i - 1] === '$')
+        );
+        rawState.inVerbatim = true;
+        rawState.verbatimInterpolated = isInterpolated;
+        rawState.interpDepth = 0;
+        i = scanVerbatimFrom(rawLine, i + 1, rawState, literals);
+        continue;
+      }
       let qCount = 0;
       while (i + qCount < n && rawLine[i + qCount] === '"') {
         qCount++;
@@ -218,7 +377,14 @@ function extractAuditableSegments(content, relPath) {
   const segments = [];
   let inCodeBlock = false;
   let codeBraceDepth = 0;
-  const rawState = { inRaw: false, quoteLen: 0 };
+  const rawState = {
+    inRaw: false,
+    quoteLen: 0,
+    inVerbatim: false,
+    verbatimInterpolated: false,
+    interpDepth: 0,
+    lastBraceDelta: 0,
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
@@ -226,7 +392,8 @@ function extractAuditableSegments(content, relPath) {
     const lineNum = i + 1;
 
     if (!trimmed) continue;
-    if (!rawState.inRaw && trimmed.startsWith('//')) continue;
+    const inMultilineStr = rawState.inRaw || rawState.inVerbatim;
+    if (!inMultilineStr && trimmed.startsWith('//')) continue;
 
     if (isRazor) {
       if (!inCodeBlock && /@code\s*\{/.test(trimmed)) {
@@ -241,17 +408,12 @@ function extractAuditableSegments(content, relPath) {
       }
 
       if (inCodeBlock) {
-        if (!rawState.inRaw) {
-          for (const ch of rawLine) {
-            if (ch === '{') codeBraceDepth++;
-            else if (ch === '}') codeBraceDepth--;
-          }
-        }
         const literals = extractCSharpLineLiterals(rawLine, rawState);
+        codeBraceDepth += rawState.lastBraceDelta;
         if (literals.length > 0) {
           segments.push({ line: lineNum, text: literals.join(' '), rawLine: trimmed });
         }
-        if (!rawState.inRaw && codeBraceDepth <= 0) inCodeBlock = false;
+        if (!rawState.inRaw && !rawState.inVerbatim && codeBraceDepth <= 0) inCodeBlock = false;
         continue;
       }
 

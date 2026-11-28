@@ -430,3 +430,161 @@ test('CLI diff mode audits lines added inside existing C# and Razor multi-line r
     fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
 });
+
+test('audits C# multi-line verbatim strings (@"...", $@"...", @$"...") including escapes and interpolations', () => {
+  const csVerbatimBad = [
+    'public class EmailTemplateService {',
+    '  string PathNote = @"C:\\temp\\logs\\";',
+    '  string Escaped = @"He said ""no 24/7"" wait no, we offer 24/7 support.";',
+    '  string Multi = @"',
+    '    // comment-like prefix inside verbatim string still audited: 99.9% uptime',
+    '    Owned bare-metal servers.',
+    '  ";',
+    '  string Interp1 = $@"<!DOCTYPE html>',
+    '    <style>body {{ color: red; }}</style>',
+    '    <p>Hello {user.Name}, Same Business Day dispatch.</p>',
+    '    <p>Tier: {(pro ? "SOC 2" : "standard")}</p>',
+    '  ";',
+    '  string Interp2 = @$"',
+    '    13-17ms Hickory Fiber guaranteed.',
+    '  ";',
+    '  string Quoted = @"""48-hour money-back""";',
+    '}',
+  ].join('\n');
+
+  const findings = auditText(csVerbatimBad, 'Services/EmailTemplateService.cs');
+  const rules = new Set(findings.map(f => f.ruleId));
+  assert.ok(rules.has('UNAPPROVED_24_7_CLAIM'));
+  assert.ok(rules.has('UNAPPROVED_SLA_PERCENT'));
+  assert.ok(rules.has('UNAPPROVED_RESPONSE_SLA'));
+  assert.ok(rules.has('UNAPPROVED_CERTIFICATION_CLAIM'));
+  assert.ok(rules.has('UNAPPROVED_FIBER_OR_LATENCY_CLAIM'));
+  assert.ok(rules.has('UNAPPROVED_GUARANTEE_OR_REFUND_CLAIM'));
+  assert.equal(findings.some(f => f.line === 2), false);
+
+  const razorVerbatim = [
+    '<h1>Email</h1>',
+    '@code {',
+    '  private string Html = $@"',
+    '    <style>.box { margin: 0; }</style>',
+    '    <p>We offer 24/7 support.</p>',
+    '  ";',
+    '  // 99.9% uptime in comment after @code verbatim closes must still be ignored',
+    '}',
+  ].join('\n');
+  const razorFindings = auditText(razorVerbatim, 'Components/Pages/Email.razor');
+  assert.equal(razorFindings.length, 1);
+  assert.equal(razorFindings[0].ruleId, 'UNAPPROVED_24_7_CLAIM');
+  assert.equal(razorFindings[0].line, 5);
+
+  const csClean = [
+    'public class CleanTemplate {',
+    '  string Html = $@"<!DOCTYPE html>',
+    '    <style>body {{ color: #111; }}</style>',
+    '    <p>Hello {user.Name}, ticket received in Hickory, NC.</p>',
+    '  ";',
+    '  string WinPath = @"C:\\srv\\dustbowl\\";',
+    '}',
+  ].join('\n');
+  assert.equal(auditText(csClean, 'Services/EmailTemplateService.cs').length, 0);
+});
+
+test('CLI --all and PR diff mode catch claims added inside C# multi-line verbatim strings while ignoring untouched lines', () => {
+  const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-verbatim-diff-'));
+  try {
+    const git = args => execFileSync('git', args, { cwd: tmpRepo, encoding: 'utf8' });
+    git(['init', '-b', 'main']);
+    git(['config', 'user.email', 'ci@dustbowl.games']);
+    git(['config', 'user.name', 'DustBowl CI']);
+
+    fs.mkdirSync(path.join(tmpRepo, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(tmpRepo, 'Services'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpRepo, 'config', 'verified-claims-allowlist.json'),
+      JSON.stringify({ schemaVersion: 1, verifiedFacts: [], legacyAuditBaseline: [] })
+    );
+
+    const svcPath = path.join(tmpRepo, 'Services', 'EmailTemplateService.cs');
+    fs.writeFileSync(
+      svcPath,
+      [
+        'public class EmailTemplateService {',
+        '  string Legacy = @"',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  ";',
+        '  string Base = $@"',
+        '    Clean header.',
+        '  ";',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'chore: init']);
+    const baseSha = git(['rev-parse', 'HEAD']).trim();
+
+    // Positive: adding clean verbatim line passes diff mode (ignores untouched line 3)
+    fs.writeFileSync(
+      svcPath,
+      [
+        'public class EmailTemplateService {',
+        '  string Legacy = @"',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  ";',
+        '  string Base = $@"',
+        '    Clean header.',
+        '    Owned hardware in Hickory, NC.',
+        '  ";',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'docs: add clean verbatim line']);
+    const cleanHead = git(['rev-parse', 'HEAD']).trim();
+
+    const passDiff = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', baseSha, '--head', cleanHead],
+      { encoding: 'utf8' }
+    );
+    assert.equal(passDiff.status, 0, passDiff.stderr);
+
+    // Negative: adding 24/7 and 99.9% uptime inside existing $@"..." fails both diff mode and --all
+    fs.writeFileSync(
+      svcPath,
+      [
+        'public class EmailTemplateService {',
+        '  string Legacy = @"',
+        '    Pre-existing 24/7 legacy text untouched in PR.',
+        '  ";',
+        '  string Base = $@"',
+        '    Clean header.',
+        '    We guarantee 24/7 support and 99.9% uptime.',
+        '  ";',
+        '}',
+      ].join('\n')
+    );
+    git(['add', '.']);
+    git(['commit', '-m', 'docs: add unverified verbatim claim']);
+    const badHead = git(['rev-parse', 'HEAD']).trim();
+
+    const failDiff = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--base', cleanHead, '--head', badHead],
+      { encoding: 'utf8' }
+    );
+    assert.equal(failDiff.status, 1);
+    assert.match(failDiff.stderr, /UNAPPROVED_24_7_CLAIM/);
+    assert.match(failDiff.stderr, /UNAPPROVED_SLA_PERCENT/);
+
+    const failAll = spawnSync(
+      process.execPath,
+      [SCRIPT_PATH, '--repo-root', tmpRepo, '--all'],
+      { encoding: 'utf8' }
+    );
+    assert.equal(failAll.status, 1);
+    assert.match(failAll.stderr, /UNAPPROVED_24_7_CLAIM/);
+    assert.match(failAll.stderr, /UNAPPROVED_SLA_PERCENT/);
+  } finally {
+    fs.rmSync(tmpRepo, { recursive: true, force: true });
+  }
+});
