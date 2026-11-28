@@ -51,8 +51,8 @@ const EXIT_MASK_CONT_RE = /^(?:(?:true|exit\s+0|echo)\b|:(?:\s|$|;|&&))/i;
 const TRAILING_OR_RE = /\|\|\s*(?:\\)?$/;
 
 const TREAT_WARN_TRUE_RE = /<TreatWarningsAsErrors>\s*true\s*<\/TreatWarningsAsErrors>/i;
-const TREAT_WARN_FALSE_RE = /<TreatWarningsAsErrors>\s*false\s*<\/TreatWarningsAsErrors>/i;
-const ALLOW_TEST_REMOVAL_RE = /Allow-Test-Removal:\s*\S+/i;
+const TREAT_WARN_FALSE_RE = /<TreatWarningsAsErrors(?:\s+[^>]*)?>\s*false\s*<\/TreatWarningsAsErrors>/i;
+const ALLOW_TEST_REMOVAL_RE = /Allow-Test-Removal:[ \t]*\S+/i;
 
 const SUPPRESSION_RULES = [
   {
@@ -616,16 +616,38 @@ export function auditRepoFiles(repoRoot) {
     const state = { inTestAttr: false, pendingOrMask: false };
     const xmlState = { inXmlComment: false };
     const isBuildFile = CSPROJ_OR_BUILD_RE.test(rel);
+    const activeLines = [];
+    const caughtWarnLines = new Set();
     for (let i = 0; i < lines.length; i++) {
       checkAddedLineRules(rel, i + 1, lines[i], state, findings);
       if (isBuildFile) {
         const uncommented = stripXmlCommentsInLine(lines[i], xmlState);
+        activeLines.push(uncommented);
         if (TREAT_WARN_FALSE_RE.test(uncommented)) {
+          caughtWarnLines.add(i + 1);
           findings.push({
             file: rel,
             line: i + 1,
             ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
             fingerprint: normalizeFingerprint(lines[i]),
+            message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
+          });
+        }
+      }
+    }
+    if (isBuildFile) {
+      const fullActive = activeLines.join('\n');
+      const globalRe = new RegExp(TREAT_WARN_FALSE_RE.source, 'gi');
+      let m;
+      while ((m = globalRe.exec(fullActive)) !== null) {
+        const startLine = fullActive.slice(0, m.index).split('\n').length;
+        const endLine = fullActive.slice(0, m.index + m[0].length).split('\n').length;
+        if (startLine !== endLine && !caughtWarnLines.has(startLine)) {
+          findings.push({
+            file: rel,
+            line: startLine,
+            ruleId: 'TREAT_WARNINGS_AS_ERRORS_WEAKENED',
+            fingerprint: normalizeFingerprint(m[0]),
             message: 'Setting <TreatWarningsAsErrors>false</TreatWarningsAsErrors> is forbidden.',
           });
         }

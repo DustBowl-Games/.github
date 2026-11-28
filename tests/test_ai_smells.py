@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / ".github" / "scripts" / "audit-ai-smells.py"
@@ -272,6 +273,36 @@ class AuditAiSmellsTests(unittest.TestCase):
             subprocess.run(["git", "commit", "--amend", "-m", "feat: clean initial commit"], cwd=repo, check=True, capture_output=True)
             rc_good = audit_ai_smells.main(["--repo-root", str(repo)])
             self.assertEqual(rc_good, 0)
+
+    def test_fails_closed_when_base_or_head_is_single_sided(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "ci@dustbowl.games"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "DustBowl CI"], cwd=repo, check=True, capture_output=True)
+            (repo / "clean.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "chore: init"], cwd=repo, check=True, capture_output=True)
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            err_base = io.StringIO()
+            with contextlib.redirect_stderr(err_base):
+                rc_base = audit_ai_smells.main(["--repo-root", str(repo), "--base", sha])
+            self.assertEqual(rc_base, 1)
+            self.assertIn("[FAIL]", err_base.getvalue())
+
+            err_head = io.StringIO()
+            with contextlib.redirect_stderr(err_head):
+                rc_head = audit_ai_smells.main(["--repo-root", str(repo), "--head", sha])
+            self.assertEqual(rc_head, 1)
+            self.assertIn("[FAIL]", err_head.getvalue())
+
+            with self.assertRaises(ValueError):
+                with mock.patch.dict(
+                    "os.environ",
+                    {"GITHUB_BASE_SHA": sha, "GITHUB_HEAD_SHA": ""},
+                ):
+                    audit_ai_smells.resolve_git_diff(repo, "", "")
 
 
 if __name__ == "__main__":

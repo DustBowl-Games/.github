@@ -443,6 +443,8 @@ def discover_repo_files(repo_root: pathlib.Path) -> list[pathlib.Path]:
 def resolve_git_diff(repo_root: pathlib.Path, base_arg: str, head_arg: str) -> str:
     base_sha = base_arg or os.environ.get("GITHUB_BASE_SHA", "")
     head_sha = head_arg or os.environ.get("GITHUB_HEAD_SHA", "")
+    if bool(base_sha) != bool(head_sha):
+        raise ValueError("Both --base and --head (or GITHUB_BASE_SHA and GITHUB_HEAD_SHA) must be set together.")
     rev_range = ""
     if base_sha and head_sha:
         rev_range = f"{base_sha}...{head_sha}"
@@ -591,6 +593,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if bool(args.base) != bool(args.head):
+        print("[FAIL] Both --base and --head must be set together.", file=sys.stderr)
+        return 1
     repo_root = pathlib.Path(args.repo_root).resolve()
     if not repo_root.is_dir():
         print(f"[FAIL] Repository root does not exist: {repo_root}", file=sys.stderr)

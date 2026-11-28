@@ -232,6 +232,32 @@ class AuditInfraSafetyTests(unittest.TestCase):
             rc_zero = audit_infra_safety.main(["--repo-root", str(root), "--no-dockerfile", "--check-k8s-helm", "--baseline", str(baseline)])
             self.assertEqual(rc_zero, 1)
 
+    def test_dockerfile_pipe_to_shell_catches_multistage_pipes_and_avoids_false_positives(self):
+        bad_cmds = (
+            "RUN curl -sSL https://example.com/install.sh | tee /tmp/x | bash",
+            "RUN wget -qO- https://example.com/install.sh | grep -v foo | sudo bash",
+            "RUN fetch -o - https://example.com/install.sh | cat | /bin/sh",
+            "RUN irm https://example.com/install.ps1 | pwsh",
+            "RUN iwr -useb https://example.com/install.ps1 | powershell",
+        )
+        for cmd in bad_cmds:
+            with self.subTest(bad_cmd=cmd):
+                df = f"FROM ubuntu:24.04\n{cmd}\nUSER 10001\n"
+                findings = audit_infra_safety.check_dockerfile_content(df, "Dockerfile")
+                self.assertEqual([f["ruleId"] for f in findings], ["DOCKERFILE_PIPE_TO_SHELL"])
+
+        safe_cmds = (
+            "RUN curl -sSL https://example.com/tool.tar.gz -o /tmp/t.tar.gz && echo ok | bash",
+            "RUN curl -sSL https://example.com/tool.tar.gz -o /tmp/t.tar.gz; echo ok | sh",
+            "RUN curl -sSL https://example.com/tool.tar.gz || bash -c 'exit 1'",
+            "RUN curl -sSL https://example.com/tool.tar.gz | sha256sum -c",
+            "RUN curl -sSL https://example.com/tool.tar.gz | tee /tmp/bash_log",
+        )
+        for cmd in safe_cmds:
+            with self.subTest(safe_cmd=cmd):
+                df = f"FROM ubuntu:24.04\n{cmd}\nUSER 10001\n"
+                self.assertEqual(audit_infra_safety.check_dockerfile_content(df, "Dockerfile"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

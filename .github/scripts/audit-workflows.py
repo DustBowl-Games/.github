@@ -56,7 +56,8 @@ UNTRUSTED_GHA_EXPR_RE = re.compile(
     re.IGNORECASE,
 )
 PR_HEAD_REF_RE = re.compile(r"(?:github\.(?:event\.pull_request\.head|head_ref)|refs/pull/)", re.IGNORECASE)
-UBUNTU_LABEL_RE = re.compile(r"^ubuntu-[A-Za-z0-9._-]+$", re.IGNORECASE)
+GITHUB_HOSTED_LABEL_RE = re.compile(r"^(?:ubuntu|windows|macos)-[A-Za-z0-9._-]+$", re.IGNORECASE)
+UBUNTU_LABEL_RE = GITHUB_HOSTED_LABEL_RE
 FORK_TERNARY_UBUNTU_BRANCH_RE = re.compile(
     r"""&&\s*(?:fromJSON\s*\(\s*)?['"](\[?\s*(?:\\?["'])?ubuntu-latest(?:\\?["'])?\s*\]?)['"]\s*\)?\s*\|\|""",
     re.IGNORECASE,
@@ -288,13 +289,67 @@ def _split_top_level_op(expr: str, op: str) -> list[str]:
     return parts
 
 
+def _has_negated_fork_paren(expr: str) -> bool:
+    """Return True if any '!(...)' sub-expression encloses head.repo.fork or head.repo.full_name."""
+    n = len(expr)
+    i = 0
+    in_sq = False
+    in_dq = False
+    while i < n:
+        ch = expr[i]
+        if ch == "'" and not in_dq:
+            if in_sq and i + 1 < n and expr[i + 1] == "'":
+                i += 2
+                continue
+            in_sq = not in_sq
+            i += 1
+            continue
+        if ch == '"' and not in_sq:
+            in_dq = not in_dq
+            i += 1
+            continue
+        if not in_sq and not in_dq and ch == "!" and (i + 1 >= n or expr[i + 1] != "="):
+            j = i + 1
+            while j < n and expr[j].isspace():
+                j += 1
+            if j < n and expr[j] == "(":
+                depth = 0
+                k = j
+                k_sq = False
+                k_dq = False
+                close_idx = n
+                while k < n:
+                    ck = expr[k]
+                    if ck == "'" and not k_dq:
+                        if k_sq and k + 1 < n and expr[k + 1] == "'":
+                            k += 2
+                            continue
+                        k_sq = not k_sq
+                    elif ck == '"' and not k_sq:
+                        k_dq = not k_dq
+                    elif not k_sq and not k_dq:
+                        if ck == "(":
+                            depth += 1
+                        elif ck == ")":
+                            depth -= 1
+                            if depth == 0:
+                                close_idx = k
+                                break
+                    k += 1
+                sub = expr[j + 1 : close_idx]
+                if re.search(r"head\.repo\.(?:fork|full_name)", sub, re.IGNORECASE):
+                    return True
+        i += 1
+    return False
+
+
 def is_fork_isolated_runs_on(runs_on: object) -> bool:
-    """Return True when runs-on uses ubuntu-latest or routes fork PRs to ubuntu-latest."""
+    """Return True when runs-on uses a standard GitHub-hosted runner or routes fork PRs to ubuntu-latest."""
     if isinstance(runs_on, str):
         s = runs_on.strip()
         if not s:
             return False
-        if UBUNTU_LABEL_RE.match(s) and "self-hosted" not in s.lower():
+        if GITHUB_HOSTED_LABEL_RE.match(s) and "self-hosted" not in s.lower():
             return True
         if s.startswith("[") and s.endswith("]"):
             try:
@@ -307,14 +362,21 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
         inner = _strip_gha_expr(s)
         if inner == "fromJSON(inputs.runner_labels)":
             return True
-        if re.search(r"(?:&&\s*false\s*(?:$|[)&|])|(?:^|[(&|])\s*false\s*&&)", inner, re.IGNORECASE):
-            return False
         m = FORK_TERNARY_UBUNTU_BRANCH_RE.search(inner)
         if not m:
             return False
         before_or = inner[: m.end()]
+        dead_falsy = r"(?:\b(?:false|0|null)\b|''|\"\"|!\s*true\b)"
+        if re.search(
+            rf"(?:&&\s*\(*\s*{dead_falsy}\s*\)*(?:$|[)&|])|(?:^|[(&|])\s*\(*\s*{dead_falsy}\s*\)*\s*&&)",
+            before_or,
+            re.IGNORECASE,
+        ):
+            return False
         falsy_lit = r"(?:\b(?:false|0|null)\b|['\"]false['\"]|['\"]{2})"
-        truthy_lit = r"(?:\b(?:true|1)\b|['\"]true['\"])"
+        truthy_lit = r"\b(?:true|1)\b"
+        any_truthy_lit = r"(?:\b(?:true|1)\b|['\"]true['\"])"
+        str_true_lit = r"['\"]true['\"]"
         fork_prop = r"(?:github\.event\.pull_request\.)?head\.repo\.fork\b"
         has_fork_pred = (
             re.search(r"head\.repo\.full_name\s*!=\s*github\.repository", before_or, re.IGNORECASE) is not None
@@ -329,17 +391,23 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
             return False
         if "self-hosted" in before_or.lower():
             return False
-        if re.search(r"!(?!=)\s*\([^)]*head\.repo\.(?:fork|full_name)", before_or, re.IGNORECASE):
+        if _has_negated_fork_paren(before_or):
             return False
         if re.search(r"!(?!=)\s*(?:github\.event\.pull_request\.)?head\.repo\.fork\b", before_or, re.IGNORECASE):
             return False
-        if re.search(rf"head\.repo\.fork\s*==\s*{falsy_lit}", before_or, re.IGNORECASE):
-            return False
-        if re.search(rf"head\.repo\.fork\s*!=\s*{truthy_lit}", before_or, re.IGNORECASE):
+        if re.search(rf"{fork_prop}\s*==\s*{falsy_lit}", before_or, re.IGNORECASE):
             return False
         if re.search(rf"{falsy_lit}\s*==\s*{fork_prop}", before_or, re.IGNORECASE):
             return False
-        if re.search(rf"{truthy_lit}\s*!=\s*{fork_prop}", before_or, re.IGNORECASE):
+        if re.search(rf"{fork_prop}\s*==\s*{str_true_lit}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"{str_true_lit}\s*==\s*{fork_prop}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"{fork_prop}\s*!=\s*{any_truthy_lit}", before_or, re.IGNORECASE):
+            return False
+        if re.search(rf"{any_truthy_lit}\s*!=\s*{fork_prop}", before_or, re.IGNORECASE):
+            return False
+        if re.search(r"([A-Za-z0-9_.\[\]'\"-]+)\s*!=\s*\1(?![A-Za-z0-9_.\[\]'\"-])", before_or, re.IGNORECASE):
             return False
         if re.search(
             r"""github\.event_name\s*==\s*['"](?:push|schedule|workflow_dispatch)['"]""",
@@ -360,7 +428,7 @@ def is_fork_isolated_runs_on(runs_on: object) -> bool:
         lowered = [str(x).strip().lower() for x in runs_on]
         if any("self-hosted" in x for x in lowered):
             return False
-        return all(UBUNTU_LABEL_RE.match(x) for x in lowered)
+        return all(GITHUB_HOSTED_LABEL_RE.match(x) for x in lowered)
     return False
 
 
@@ -518,18 +586,13 @@ def audit_workflow_doc(doc: object, rel_file: str) -> list[dict]:
                     })
             elif not job_uses:
                 runs_on = job.get("runs-on")
-                runs_on_str = json.dumps(runs_on) if isinstance(runs_on, list) else str(runs_on or "")
-                if (
-                    ("self-hosted" in runs_on_str.lower() or "dustbowl-linux" in runs_on_str.lower())
-                    and not job_exempt_from_pr
-                    and not is_fork_isolated_runs_on(runs_on)
-                ):
+                if not job_exempt_from_pr and not is_fork_isolated_runs_on(runs_on):
                     findings.append({
                         "file": norm_file,
                         "job": str(job_id),
                         "ruleId": "WF_FORK_PR_RUNNER_ISOLATION",
                         "fingerprint": f"job:{job_id}:runs-on",
-                        "message": f"Job '{job_id}' runs on self-hosted under pull_request without routing fork PRs to ubuntu-latest.",
+                        "message": f"Job '{job_id}' runs on non-fork-isolated runner under pull_request without routing fork PRs to ubuntu-latest.",
                     })
 
         steps = job.get("steps") or []
